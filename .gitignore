@@ -1,0 +1,7 @@
+# Build output
+zig-out
+.zig-cache
+
+# The llama.cpp sources, fetched by `make clone`. Not vendored here: this
+# repository is the build system, not a fork.
+llama.cpp

@@ -1,0 +1,15 @@
+.{
+    .name = .llamacpp,
+    .version = "0.3.0",
+    .fingerprint = 0xba4bceda0b5665ac,
+    .minimum_zig_version = "0.16.0",
+    // Only this build system. The llama.cpp sources live in a subdirectory
+    // fetched by `make clone` and are not part of this package.
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "Makefile",
+        "zig",
+    },
+    .dependencies = .{},
+}
