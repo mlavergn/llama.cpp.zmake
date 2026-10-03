@@ -133,6 +133,17 @@ Things CMake does that are easy to miss, each of which cost real debugging:
   reaches it. Do not substitute `--sysroot`: with the libc file present it is
   unnecessary, and `b.sysroot` would also be applied to the host `metal_embed`
   tool.
+- **Both Apple platforms link Apple's libc++, not Zig's.** Zig 0.16.0 cannot
+  build its bundled libc++ against the 27.x SDKs: it compiles `random.cpp` with
+  a hardcoded `-std=c++23`, which turns clang's `modules` feature on, and SDK
+  27's `<math.h>` then withholds `INFINITY`, which libc++'s
+  `__random/clamp_to_integral.h` uses. The symptom is `sub-compilation of
+  libcxx failed` at the first link. So `link_libcpp` is off on Apple, the
+  SDK's `usr/include/c++/v1` goes in with `-I` (not `-isystem`, which loses to
+  clang's own paths), and the executable links `libc++.tbd` and
+  `libc++abi.tbd`. That is the runtime CMake links too. Linux keeps Zig's
+  libc++. The libc file above is still needed for the C headers. Revert when
+  the sibling llamazig repo's `make -C testcase cxx20` passes.
 - **The Apple deployment targets are 26.0, and lowering them breaks the build.**
   At 13.0 the Xcode 26 SDK produces 145 errors: Accelerate's Sparse headers
   annotate symbols as macOS 15.5+, and clang makes unguarded use of them an

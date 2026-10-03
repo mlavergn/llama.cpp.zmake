@@ -108,6 +108,69 @@ const cxx_std = [_][]const u8{"-std=c++17"} ++ quiet;
 // freely between void* and Objective-C object pointers.
 const objc_std = [_][]const u8{"-std=c11"} ++ quiet;
 
+// -----------------------------------------------------------------------------
+// Apple's libc++ instead of Zig's
+//
+// **Zig 0.16.0 cannot build its own libc++ against the 27.x SDKs**, macOS and
+// iOS alike. It compiles `libcxx/src/random.cpp` with a hardcoded
+// `-std=c++23`, which turns clang's `modules` feature on; the SDK's `<math.h>`
+// then declines to define `INFINITY` (C23 moved it to `<float.h>`), and
+// libc++'s own `__random/clamp_to_integral.h:47` uses it without including
+// that. The symptom is `error: sub-compilation of libcxx failed` on the first
+// link. The full diagnosis, with a reproducer, is in the sibling llamazig
+// repository's `testcase/`, which hit it first.
+//
+// No flag, environment variable, or libc file reaches that `-std`, so on the
+// Apple platforms this build links **Apple's** libc++ instead -- the SDK's
+// headers and its `.tbd`s together, a matched pair. It is also the C++ runtime
+// the CMake reference build links, so this moves the build closer to it, not
+// further away. Linux is unaffected and keeps Zig's libc++.
+//
+// Two details that are easy to get wrong, both measured in llamazig:
+//
+// - The headers go in with `-I`, not `-isystem`. `-isystem` puts them after
+//   clang's own include paths, and `<cstdio>` then fails with "tried including
+//   <stdio.h> but didn't find libc++'s <stdio.h> header".
+// - `link_libcpp = false` also switches the C++ header search off, which is
+//   why the include path is added by hand rather than merely dropped.
+//
+// **Revert when the toolchain is fixed** -- llamazig's `make -C testcase
+// cxx20` passing is the signal. Drop `appleCxxStd` and `linkAppleLibcxx`, and
+// set `link_libcpp = true` unconditionally in `baseModule`.
+
+/// The C++ standard flags, plus Apple's libc++ headers on Apple platforms.
+///
+/// Parameters:
+/// - `b`: the build graph, for the allocator.
+/// - `sdk`: the Apple SDK root; null on Linux, where Zig's libc++ is used.
+///
+/// Return: a flag list owned by the build graph.
+fn appleCxxStd(b: *std.Build, sdk: ?[]const u8) ![]const []const u8 {
+    const path = sdk orelse return &cxx_std;
+    return join(b, &cxx_std, &.{
+        "-nostdinc++",
+        b.fmt("-I{s}/usr/include/c++/v1", .{path}),
+    });
+}
+
+/// Links Apple's libc++ into an executable, standing in for `link_libcpp`.
+///
+/// Only executables need it: a static archive never links. `libc++abi` is
+/// named as well because the `__cxa_*` guard, exception and personality
+/// symbols live there, and `libc++.tbd` does not re-export them.
+///
+/// Parameters:
+/// - `b`: the build graph, for the allocator.
+/// - `mod`: the executable's root module.
+/// - `sdk`: the Apple SDK root; null on Linux, where this is a no-op.
+///
+/// Return: nothing.
+fn linkAppleLibcxx(b: *std.Build, mod: *std.Build.Module, sdk: ?[]const u8) void {
+    const path = sdk orelse return;
+    mod.addObjectFile(.{ .cwd_relative = b.fmt("{s}/usr/lib/libc++.tbd", .{path}) });
+    mod.addObjectFile(.{ .cwd_relative = b.fmt("{s}/usr/lib/libc++abi.tbd", .{path}) });
+}
+
 /// Backend selection and build metadata that every platform shares.
 const base_defines = [_][]const u8{
     "-DGGML_USE_CPU",
@@ -317,6 +380,11 @@ const Config = struct {
     /// flags. A libc file is the one knob that reaches it.
     libc_file: ?std.Build.LazyPath,
 
+    /// The bare C++ flags, without the platform's defines: `cxx_std` plus,
+    /// on Apple platforms, the path to the SDK's libc++ headers. For the
+    /// vendored libraries CMake compiles without ggml's defines.
+    cxx_std: []const []const u8,
+
     /// Compiler flags per language, with the platform's defines already
     /// folded in.
     c: []const []const u8,
@@ -360,14 +428,16 @@ pub fn build(b: *std.Build) !void {
     if (platform != .ios) try defs.appendSlice(b.allocator, &subprocess_defines);
     if (platform == .linux) try defs.appendSlice(b.allocator, &linux_defines);
 
+    const cxx = try appleCxxStd(b, sdk);
     const cfg = Config{
         .target = target,
         .optimize = optimize,
         .platform = platform,
         .sdk = sdk,
         .libc_file = if (sdk) |s| writeAppleLibcFile(b, s) else null,
+        .cxx_std = cxx,
         .c = try join(b, &c_std, defs.items),
-        .cxx = try join(b, &cxx_std, defs.items),
+        .cxx = try join(b, cxx, defs.items),
         .objc = try join(b, &objc_std, defs.items),
     };
 
@@ -446,7 +516,8 @@ fn baseModule(b: *std.Build, cfg: Config) *std.Build.Module {
         .target = cfg.target,
         .optimize = cfg.optimize,
         .link_libc = true,
-        .link_libcpp = true,
+        // Apple platforms link the SDK's libc++ instead; see `appleCxxStd`.
+        .link_libcpp = cfg.sdk == null,
         // These sources are not UBSan-clean -- they rely on pointer arithmetic
         // that is technically undefined but universally works -- and Zig turns
         // the C sanitizers on in Debug. CMake never enabled them.
@@ -472,8 +543,9 @@ fn addLibrary(b: *std.Build, cfg: Config, name: []const u8, mod: *std.Build.Modu
 }
 
 /// Wraps `b.addExecutable`, attaching the libc file when the platform needs
-/// one. See `addLibrary`.
+/// one, and Apple's libc++. See `addLibrary` and `linkAppleLibcxx`.
 fn addExecutable(b: *std.Build, cfg: Config, name: []const u8, mod: *std.Build.Module) *std.Build.Step.Compile {
+    linkAppleLibcxx(b, mod, cfg.sdk);
     const exe = b.addExecutable(.{ .name = name, .root_module = mod });
     exe.setLibCFile(cfg.libc_file);
     return exe;
@@ -605,7 +677,7 @@ fn addCli(
         mod.addCSourceFiles(.{
             .root = b.path(src_root),
             .files = &[_][]const u8{"vendor/hash/hash.cpp"},
-            .flags = &cxx_std,
+            .flags = cfg.cxx_std,
         });
         // sha1.c is C++ despite the extension. CMake sets LANGUAGE CXX on it
         // (vendor/hash/CMakeLists.txt:32) because the file wraps itself in a
@@ -613,7 +685,7 @@ fn addCli(
         mod.addCSourceFiles(.{
             .root = b.path(src_root),
             .files = &[_][]const u8{"vendor/hash/sha1/sha1.c"},
-            .flags = &cxx_std,
+            .flags = cfg.cxx_std,
             .language = .cpp,
         });
         mod.addCSourceFiles(.{
@@ -635,7 +707,7 @@ fn addCli(
         mod.addCSourceFiles(.{
             .root = b.path(src_root),
             .files = &[_][]const u8{"vendor/cpp-httplib/httplib.cpp"},
-            .flags = &(cxx_std ++ httplib_defines),
+            .flags = try join(b, cfg.cxx_std, &httplib_defines),
         });
         break :blk addLibrary(b, cfg, "cpp-httplib", mod);
     };
@@ -723,7 +795,7 @@ fn addCli(
         mod.addIncludePath(b.path("zig/ui-stub"));
         mod.addCSourceFiles(.{
             .files = &[_][]const u8{"zig/ui-stub/ui.cpp"},
-            .flags = &cxx_std,
+            .flags = cfg.cxx_std,
         });
         break :blk addLibrary(b, cfg, "llama-ui", mod);
     };
