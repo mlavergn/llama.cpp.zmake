@@ -176,6 +176,11 @@ const base_defines = [_][]const u8{
     "-DGGML_USE_CPU",
     "-DGGML_SCHED_MAX_COPIES=4",
     "-DGGML_USE_LLAMAFILE",
+    // GGML_CPU_REPACK defaults ON upstream (ggml/CMakeLists.txt:152).
+    // Without it ggml-cpu.cpp never registers the repack buffer type and
+    // repack.cpp is unreachable. This build is the bit-exact reference
+    // for llamazig's ops-diff/node-diff/parity-port, so it has to match.
+    "-DGGML_USE_CPU_REPACK",
     "-DGGML_VERSION=\"" ++ version ++ "\"",
     "-DGGML_COMMIT=\"" ++ commit ++ "\"",
 };
