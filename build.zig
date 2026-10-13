@@ -108,69 +108,6 @@ const cxx_std = [_][]const u8{"-std=c++17"} ++ quiet;
 // freely between void* and Objective-C object pointers.
 const objc_std = [_][]const u8{"-std=c11"} ++ quiet;
 
-// -----------------------------------------------------------------------------
-// Apple's libc++ instead of Zig's
-//
-// **Zig 0.16.0 cannot build its own libc++ against the 27.x SDKs**, macOS and
-// iOS alike. It compiles `libcxx/src/random.cpp` with a hardcoded
-// `-std=c++23`, which turns clang's `modules` feature on; the SDK's `<math.h>`
-// then declines to define `INFINITY` (C23 moved it to `<float.h>`), and
-// libc++'s own `__random/clamp_to_integral.h:47` uses it without including
-// that. The symptom is `error: sub-compilation of libcxx failed` on the first
-// link. The full diagnosis, with a reproducer, is in the sibling llamazig
-// repository's `testcase/`, which hit it first.
-//
-// No flag, environment variable, or libc file reaches that `-std`, so on the
-// Apple platforms this build links **Apple's** libc++ instead -- the SDK's
-// headers and its `.tbd`s together, a matched pair. It is also the C++ runtime
-// the CMake reference build links, so this moves the build closer to it, not
-// further away. Linux is unaffected and keeps Zig's libc++.
-//
-// Two details that are easy to get wrong, both measured in llamazig:
-//
-// - The headers go in with `-I`, not `-isystem`. `-isystem` puts them after
-//   clang's own include paths, and `<cstdio>` then fails with "tried including
-//   <stdio.h> but didn't find libc++'s <stdio.h> header".
-// - `link_libcpp = false` also switches the C++ header search off, which is
-//   why the include path is added by hand rather than merely dropped.
-//
-// **Revert when the toolchain is fixed** -- llamazig's `make -C testcase
-// cxx20` passing is the signal. Drop `appleCxxStd` and `linkAppleLibcxx`, and
-// set `link_libcpp = true` unconditionally in `baseModule`.
-
-/// The C++ standard flags, plus Apple's libc++ headers on Apple platforms.
-///
-/// Parameters:
-/// - `b`: the build graph, for the allocator.
-/// - `sdk`: the Apple SDK root; null on Linux, where Zig's libc++ is used.
-///
-/// Return: a flag list owned by the build graph.
-fn appleCxxStd(b: *std.Build, sdk: ?[]const u8) ![]const []const u8 {
-    const path = sdk orelse return &cxx_std;
-    return join(b, &cxx_std, &.{
-        "-nostdinc++",
-        b.fmt("-I{s}/usr/include/c++/v1", .{path}),
-    });
-}
-
-/// Links Apple's libc++ into an executable, standing in for `link_libcpp`.
-///
-/// Only executables need it: a static archive never links. `libc++abi` is
-/// named as well because the `__cxa_*` guard, exception and personality
-/// symbols live there, and `libc++.tbd` does not re-export them.
-///
-/// Parameters:
-/// - `b`: the build graph, for the allocator.
-/// - `mod`: the executable's root module.
-/// - `sdk`: the Apple SDK root; null on Linux, where this is a no-op.
-///
-/// Return: nothing.
-fn linkAppleLibcxx(b: *std.Build, mod: *std.Build.Module, sdk: ?[]const u8) void {
-    const path = sdk orelse return;
-    mod.addObjectFile(.{ .cwd_relative = b.fmt("{s}/usr/lib/libc++.tbd", .{path}) });
-    mod.addObjectFile(.{ .cwd_relative = b.fmt("{s}/usr/lib/libc++abi.tbd", .{path}) });
-}
-
 /// Backend selection and build metadata that every platform shares.
 const base_defines = [_][]const u8{
     "-DGGML_USE_CPU",
@@ -367,7 +304,7 @@ const cli_impl_sources = [_][]const u8{
 /// in `build` and threaded through the `add*` functions.
 const Config = struct {
     target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
+    optimize: std.lang.Optimize,
     platform: Platform,
 
     /// Apple SDK path. Null on Linux.
@@ -385,9 +322,8 @@ const Config = struct {
     /// flags. A libc file is the one knob that reaches it.
     libc_file: ?std.Build.LazyPath,
 
-    /// The bare C++ flags, without the platform's defines: `cxx_std` plus,
-    /// on Apple platforms, the path to the SDK's libc++ headers. For the
-    /// vendored libraries CMake compiles without ggml's defines.
+    /// The bare C++ flags, without the platform's defines. For the vendored
+    /// libraries CMake compiles without ggml's defines.
     cxx_std: []const []const u8,
 
     /// Compiler flags per language, with the platform's defines already
@@ -405,7 +341,12 @@ const Config = struct {
 /// Return: nothing on success; propagates target, SDK resolution, and
 /// directory-read failures.
 pub fn build(b: *std.Build) !void {
-    const target = b.standardTargetOptions(.{});
+    // Zig 0.17 recognises the M5 as `apple_m5`, with i8mm and SME, where 0.16
+    // fell back to the macOS baseline (`apple_m1`). The native default would
+    // therefore compile `__ARM_FEATURE_MATMUL_INT8` kernels into ggml-cpu --
+    // 158 i8mm instructions, measured -- and stop matching a build that names
+    // its triple. The default stays at the baseline; `-Dcpu=native` opts in.
+    const target = b.standardTargetOptions(.{ .default_target = .{ .cpu_model = .baseline } });
     const optimize = b.standardOptimizeOption(.{});
     const platform = Platform.detect(target.result) orelse {
         std.log.err(
@@ -433,16 +374,15 @@ pub fn build(b: *std.Build) !void {
     if (platform != .ios) try defs.appendSlice(b.allocator, &subprocess_defines);
     if (platform == .linux) try defs.appendSlice(b.allocator, &linux_defines);
 
-    const cxx = try appleCxxStd(b, sdk);
     const cfg = Config{
         .target = target,
         .optimize = optimize,
         .platform = platform,
         .sdk = sdk,
         .libc_file = if (sdk) |s| writeAppleLibcFile(b, s) else null,
-        .cxx_std = cxx,
+        .cxx_std = &cxx_std,
         .c = try join(b, &c_std, defs.items),
-        .cxx = try join(b, cxx, defs.items),
+        .cxx = try join(b, &cxx_std, defs.items),
         .objc = try join(b, &objc_std, defs.items),
     };
 
@@ -461,7 +401,7 @@ pub fn build(b: *std.Build) !void {
 
     const run = b.addRunArtifact(cli);
     run.step.dependOn(b.getInstallStep());
-    if (b.args) |args| run.addArgs(args);
+    run.addPassthruArgs();
     const run_step = b.step("run", "Run llama-cli");
     run_step.dependOn(&run.step);
 }
@@ -494,9 +434,12 @@ fn resolveAppleSdk(b: *std.Build, target: std.Target) ![]const u8 {
 /// `Config.libc_file` for why a named triple needs this and a native one does
 /// not.
 ///
-/// The remaining keys are required by the file format and empty by design:
-/// Darwin needs no crt files (libSystem provides the entry stubs), and the
-/// MSVC and gcc keys are for other platforms entirely.
+/// Zig 0.17 requires two keys it did not before: `darwin_sdk_dir`, the SDK
+/// root, and a non-empty `crt_dir`. Both take the values Zig's own native
+/// detection writes (`LibCInstallation.findNative`), so a named triple sees the
+/// same libc a native build does. The remaining keys are required by the file
+/// format and empty by design: the MSVC and cc keys are for other platforms
+/// entirely.
 ///
 /// Parameters:
 /// - `b`: the build graph, for its allocator and generated-file step.
@@ -507,12 +450,13 @@ fn writeAppleLibcFile(b: *std.Build, sdk: []const u8) std.Build.LazyPath {
     return b.addWriteFiles().add("apple-libc.txt", b.fmt(
         \\include_dir={s}/usr/include
         \\sys_include_dir={s}/usr/include
-        \\crt_dir=
+        \\crt_dir={s}/usr/lib
         \\msvc_lib_dir=
         \\kernel32_lib_dir=
-        \\gcc_dir=
+        \\cc_dir=
+        \\darwin_sdk_dir={s}
         \\
-    , .{ sdk, sdk }));
+    , .{ sdk, sdk, sdk, sdk }));
 }
 
 /// Applies the settings every C/C++ target in this build shares.
@@ -521,18 +465,17 @@ fn baseModule(b: *std.Build, cfg: Config) *std.Build.Module {
         .target = cfg.target,
         .optimize = cfg.optimize,
         .link_libc = true,
-        // Apple platforms link the SDK's libc++ instead; see `appleCxxStd`.
-        .link_libcpp = cfg.sdk == null,
+        .link_libcpp = true,
         // These sources are not UBSan-clean -- they rely on pointer arithmetic
         // that is technically undefined but universally works -- and Zig turns
         // the C sanitizers on in Debug. CMake never enabled them.
         .sanitize_c = .off,
     });
     if (cfg.sdk) |sdk| {
-        mod.addFrameworkPath(.{ .cwd_relative = b.fmt("{s}/System/Library/Frameworks", .{sdk}) });
+        mod.addFrameworkPath(b.graph.cwdRelativePath(b.fmt("{s}/System/Library/Frameworks", .{sdk})));
         // Only iOS needs the library path spelled out; for macOS Zig already
         // searches the SDK, and this is the same directory it would find.
-        mod.addLibraryPath(.{ .cwd_relative = b.fmt("{s}/usr/lib", .{sdk}) });
+        mod.addLibraryPath(b.graph.cwdRelativePath(b.fmt("{s}/usr/lib", .{sdk})));
     }
     return mod;
 }
@@ -548,9 +491,8 @@ fn addLibrary(b: *std.Build, cfg: Config, name: []const u8, mod: *std.Build.Modu
 }
 
 /// Wraps `b.addExecutable`, attaching the libc file when the platform needs
-/// one, and Apple's libc++. See `addLibrary` and `linkAppleLibcxx`.
+/// one. See `addLibrary`.
 fn addExecutable(b: *std.Build, cfg: Config, name: []const u8, mod: *std.Build.Module) *std.Build.Step.Compile {
-    linkAppleLibcxx(b, mod, cfg.sdk);
     const exe = b.addExecutable(.{ .name = name, .root_module = mod });
     exe.setLibCFile(cfg.libc_file);
     return exe;
@@ -619,7 +561,7 @@ fn embedMetalKernel(b: *std.Build, kind: []const u8) std.Build.LazyPath {
         .root_module = b.createModule(.{
             .root_source_file = b.path("zig/metal_embed.zig"),
             .target = b.graph.host,
-            .optimize = .Debug,
+            .optimize = .debug,
         }),
     });
 
@@ -867,7 +809,11 @@ fn appendGlob(b: *std.Build, files: *std.ArrayList([]const u8), dir: []const u8,
     // `dir` is relative to the checkout, and so are the paths appended, since
     // the source lists are resolved against `src_root`.
     const full = b.fmt("{s}/{s}", .{ src_root, dir });
-    var handle = try b.build_root.handle.openDir(b.graph.io, full, .{ .iterate = true });
+    // Zig 0.17 reuses a configured build graph until one of its declared
+    // inputs changes, and a directory listing is not one by default. A file
+    // added to or removed from the checkout must reconfigure.
+    b.dependOnDirectoryContents(b.path(full));
+    var handle = try b.root.openDir(b.graph.io, full, .{ .iterate = true });
     defer handle.close(b.graph.io);
 
     var it = handle.iterate();

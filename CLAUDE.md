@@ -56,7 +56,7 @@ They differ only in `-Dtarget` — `build.zig` derives everything else from the
 OS in the triple — so adding a fourth platform is a `Platform` variant and a
 Makefile line, not a restructuring.
 
-Requires Zig **0.16.0**. `macos` and `ios` need the Xcode SDK, the macosx and
+Requires Zig **0.17.0**. `macos` and `ios` need the Xcode SDK, the macosx and
 iphoneos ones respectively. `linux` cross-compiles from any host with no
 sysroot: Zig ships glibc and its own libc++.
 
@@ -138,7 +138,7 @@ by the macOS diff alone; a change to `Platform`, the shared define lists, or
 
 ## Conventions
 
-- Zig **0.16.0** APIs. `std.Build.Module` options rather than the older compile
+- Zig **0.17.0** APIs. `std.Build.Module` options rather than the older compile
   step setters; `.language` on `addCSourceFiles` rather than `-x c++` flags,
   which Zig places after the file where they have no effect.
 - Source lists are kept **relative to the checkout** and each `addCSourceFiles`
@@ -203,18 +203,15 @@ Six CMake behaviours that are easy to miss. Each of these cost real debugging;
   lives on `Step.Compile`, not on `Module`, which is why
   `addLibrary`/`addExecutable` wrap the builtins instead of `baseModule`
   handling it.
-- **Both Apple platforms link Apple's libc++, not Zig's.** Zig 0.16.0 cannot
-  build its bundled libc++ against the 27.x SDKs: it compiles `random.cpp` with
-  a hardcoded `-std=c++23`, which turns clang's `modules` feature on, and SDK
-  27's `<math.h>` then withholds `INFINITY`, which libc++'s
-  `__random/clamp_to_integral.h` uses. The symptom is `sub-compilation of
-  libcxx failed` at the first link. So `link_libcpp` is off on Apple, the
-  SDK's `usr/include/c++/v1` goes in with `-I` (not `-isystem`, which loses to
-  clang's own paths), and the executable links `libc++.tbd` and
-  `libc++abi.tbd`. That is the runtime CMake links too. Linux keeps Zig's
-  libc++. The libc file is still needed for the C headers. See the note above
-  `appleCxxStd` in `build.zig`; revert when the sibling llamazig repo's
-  `make -C testcase cxx20` passes.
+- **Every platform links Zig's bundled libc++.** Under Zig 0.16 the Apple
+  platforms linked the SDK's `libc++.tbd` instead, because 0.16 could not
+  build its own against the 27.x SDKs: `random.cpp` under a hardcoded
+  `-std=c++23` turned clang's `modules` feature on, and SDK 27's `<math.h>`
+  then withheld `INFINITY`, which libc++'s `__random/clamp_to_integral.h`
+  uses. Zig 0.17 builds it cleanly, so `link_libcpp` is on everywhere again.
+  Zig's libc++ is 22.1.8 against the SDK's 22.1.6, with the same ABI
+  configuration (version 1, no CityHash fix); the CMake reference still links
+  Apple's, which is a difference worth remembering when diffing tokens.
 - **The Apple deployment targets are 26.0, and lowering them breaks the build.**
   At 13.0 the Xcode 26 SDK produces 145 errors: Accelerate's Sparse headers
   annotate symbols as macOS 15.5+, and clang makes unguarded use of them an
@@ -222,14 +219,18 @@ Six CMake behaviours that are easy to miss. Each of these cost real debugging;
   26.0 without a libc file you instead get `CF_BRIDGED_TYPE` redefinitions and
   a missing `libDER/DERItem.h`, which is the include-chain problem above, not
   an availability one. They are two separate faults and both must be fixed.
-- **iOS pins `-Dcpu=apple_a18`; macOS and Linux need no pin.** Zig's aarch64
-  baseline already implies `DOTPROD` and `FP16_VECTOR_ARITHMETIC` on macOS and
-  Linux — the same feature set the native build selects, which is why naming a
-  triple for macOS changes no ggml kernel. The iOS baseline is bare NEON, which
-  drops the dotprod quant kernels entirely.
+- **iOS pins `-Dcpu=apple_a18`; everything else defaults to the baseline.**
+  Zig's aarch64 baseline already implies `DOTPROD` and `FP16_VECTOR_ARITHMETIC`
+  on macOS and Linux. Under Zig 0.16 that was also what a native macOS build
+  selected; Zig 0.17 recognises the M5 as `apple_m5`, with i8mm, and a native
+  build compiled 158 i8mm instructions into `libggml.a`. So `build.zig` makes
+  the baseline the default CPU, and naming a triple for macOS again changes no
+  ggml kernel. `-Dcpu=native` opts back in. The iOS baseline is bare NEON,
+  which drops the dotprod quant kernels entirely.
 
   The pin targets the iPhone 17 Pro Max, whose SoC is the A19 Pro. Zig 0.16
-  models Apple cores only up to `apple_a18`, so the A19 Pro cannot be named;
+  modelled Apple cores only up to `apple_a18`, so the A19 Pro could not be
+  named (0.17 adds `apple_a19`; moving the pin is a separate decision);
   A18 is its immediate predecessor and a strict subset, so the generated code
   runs correctly on it and uses every feature ggml can consume. Only
   A19-specific scheduling is given up, not instructions.

@@ -31,12 +31,14 @@ LINUX_TARGET ?= aarch64-linux-gnu
 # iOS pins a CPU; the other two do not need to.
 #
 # Zig's aarch64 baseline already implies DOTPROD and FP16_VECTOR_ARITHMETIC for
-# macOS and Linux -- the same feature set the native build selects, which is
-# why naming a triple for macOS changes no ggml kernel. The iOS baseline is
-# bare NEON, which would drop the dotprod quant kernels entirely.
+# macOS and Linux. build.zig makes the baseline the default CPU, so naming a
+# triple for macOS changes no ggml kernel -- under Zig 0.17 "native" on an M5
+# would add i8mm. The iOS baseline is bare NEON, which would drop the dotprod
+# quant kernels entirely.
 #
 # apple_a18 targets the iPhone 17 Pro Max, whose SoC is the A19 Pro. Zig 0.16
-# models Apple cores only up to apple_a18, so the A19 Pro cannot be named; A18
+# modelled Apple cores only up to apple_a18, so the A19 Pro could not be named
+# (0.17 adds apple_a19; moving the pin is a separate decision); A18
 # is its immediate predecessor and a strict subset, so the code generated here
 # runs correctly on it and uses every feature ggml can consume. What is given
 # up is A19-specific instruction scheduling, not instructions.
