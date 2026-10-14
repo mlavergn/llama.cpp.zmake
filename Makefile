@@ -57,6 +57,9 @@ IOS_CPU ?= apple_a18
 #   make linux RELEASE=
 RELEASE ?= --release=fast
 
+# The model `make cli` chats with.
+MODEL ?= Qwen3.5-2B-Q4_K_M.gguf
+
 # Fetch the sources this build compiles.
 clone:
 	git clone https://github.com/ggerganov/llama.cpp.git
@@ -74,9 +77,12 @@ dist:
 lib:
 	zig build lib
 
-# llama-cli only.
+# Build llama-cli optimized and start an interactive chat with $(MODEL).
+# Extra flags go in ARGS, e.g.
+#   make cli MODEL=other.gguf ARGS="-c 4096"
 cli:
-	zig build cli
+	zig build cli $(RELEASE)
+	./zig-out/bin/llama-cli -m $(MODEL) $(ARGS)
 
 # Per-platform builds of llama-cli, all arm64.
 #

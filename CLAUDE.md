@@ -38,7 +38,7 @@ llama.cpp/                           sources (gitignored, `make clone`)
 ```sh
 make clone     # fetch llama.cpp at $(LLAMA_CPP_TAG), currently v0.3.0
 make           # everything for the host: ggml, libllama, llama-cli
-make cli       # llama-cli only
+make cli       # llama-cli, optimized, then chat with $(MODEL)
 make lib       # ggml and libllama only
 make dist      # optimized (zig build --release=fast)
 make run ARGS="-m model.gguf -ngl 99 -p 'hello' -st"

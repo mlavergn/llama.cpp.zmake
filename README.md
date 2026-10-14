@@ -28,7 +28,7 @@ checkout replaced without reconciling anything.
 ```sh
 make clone     # fetch llama.cpp at v0.3.0
 make           # build everything for the host
-make cli       # llama-cli only
+make cli       # llama-cli, optimized, then chat with $(MODEL)
 make lib       # ggml and libllama only
 make dist      # optimized
 make run ARGS="-m model.gguf -ngl 99 -p 'hello' -st"
