@@ -34,13 +34,14 @@ make dist      # optimized
 make run ARGS="-m model.gguf -ngl 99 -p 'hello' -st"
 ```
 
-Per-platform builds of `llama-cli`, all arm64, each optimized and installed
-under a prefix of its own so the three can coexist:
+Per-platform builds of `llama-cli`, arm64 everywhere and x86_64 on Linux, each
+optimized and installed under a prefix of its own so they can coexist:
 
 ```sh
-make macos     # -> zig-out/macos/bin/llama-cli
-make ios       # -> zig-out/ios/bin/llama-cli
-make linux     # -> zig-out/linux/bin/llama-cli
+make macos         # -> zig-out/macos/bin/llama-cli
+make ios           # -> zig-out/ios/bin/llama-cli
+make linux         # -> zig-out/linux/bin/llama-cli
+make linux-x86_64  # -> zig-out/linux-x86_64/bin/llama-cli, AVX2; X86_CPU=x86_64_v4 for AVX-512
 ```
 
 Requires Zig 0.17.0. `make macos` and `make ios` need the Xcode SDK — the
@@ -63,6 +64,19 @@ driven with: static libraries, BLAS and OpenMP off, no curl.
 | macOS  | on, embedded | on  | on  | `aarch64-macos.26.0` |
 | iOS    | on, embedded | on  | off | `aarch64-ios.26.0`, cpu `apple_a18` |
 | Linux  | off          | off | on  | `aarch64-linux-gnu`, `_GNU_SOURCE` |
+| Linux x86_64 | off    | off | on  | `x86_64-linux-gnu`, cpu `x86_64_v3`, `_GNU_SOURCE`; `arch/x86` sources |
+
+**Vulkan, optional:** `-Dvulkan` (`make … VULKAN=1`) adds ggml's Vulkan
+backend on any platform, as CMake's `GGML_VULKAN` does. It needs what CMake
+needs: `glslc` (`-Dglslc`, else the one on `PATH`), the Vulkan and SPIR-V
+headers (`-Dvulkan-include`, default `/usr/include` on Linux), and `libvulkan`
+to link `llama-cli`. `build.zig` asks `glslc` which shader extensions it
+accepts, as `ggml-vulkan/CMakeLists.txt` does, and builds upstream's own
+`vulkan-shaders-gen` to compile the 147 shader files -- 1,440 variants with
+no optional extension, 1,980 with all of them. Those answers and the header
+version decide which C++ compiles, so two builds compared on bits must use
+the same `glslc` and headers. Added for llamazig's Vulkan port under an
+explicit grant.
 
 **Verified:** on macOS the resulting `llama-cli` produces token-identical
 output to a CMake + Apple-clang build of the same sources, on a fixed model,

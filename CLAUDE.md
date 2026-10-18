@@ -48,6 +48,7 @@ make distclean # also removes the fetched sources
 make macos     # llama-cli, arm64, optimized -> zig-out/macos/bin/
 make ios       #                             -> zig-out/ios/bin/
 make linux     #                             -> zig-out/linux/bin/
+make linux-x86_64 # x86_64, AVX2 by default     -> zig-out/linux-x86_64/bin/
 ```
 
 The three platform targets each install under a prefix of their own; a single
@@ -72,15 +73,33 @@ llama-cli -> llama-cli-impl -> llama-server-impl -> {server-context, llama-ui, c
 The CLI pulls in the whole server because `cli-context.cpp` drives it
 in-process. That is not a design choice made here; it is how upstream is wired.
 
-Three arm64 platforms, distinguished by the `Platform` enum in `build.zig`.
+Three platforms, distinguished by the `Platform` enum in `build.zig`, all arm64 --
+and Linux on x86_64 too, where `archSources` swaps ggml-cpu's `arch/arm` pair for
+`arch/x86` (`ggml/src/ggml-cpu/CMakeLists.txt:240`). Added for llamazig's x86 port
+under an explicit grant; `-Dcpu` picks the SIMD level, `x86_64_v3` (AVX2) by the
+Makefile's default.
+
 Everything they share matches the `-D` flags CMake was being driven with:
 static libraries, BLAS and OpenMP off, no curl.
+
+**Vulkan, optional:** `-Dvulkan` (`make … VULKAN=1`) adds ggml's Vulkan
+backend on any platform, as CMake's `GGML_VULKAN` does. It needs what CMake
+needs: `glslc` (`-Dglslc`, else the one on `PATH`), the Vulkan and SPIR-V
+headers (`-Dvulkan-include`, default `/usr/include` on Linux), and `libvulkan`
+to link `llama-cli`. `build.zig` asks `glslc` which shader extensions it
+accepts, as `ggml-vulkan/CMakeLists.txt` does, and builds upstream's own
+`vulkan-shaders-gen` to compile the 147 shader files -- 1,440 variants with
+no optional extension, 1,980 with all of them. Those answers and the header
+version decide which C++ compiles, so two builds compared on bits must use
+the same `glslc` and headers. Added for llamazig's Vulkan port under an
+explicit grant.
 
 | | Metal | Accelerate | subprocess | target |
 |--------|-------|------------|------------|--------|
 | macOS  | on, embedded | on  | on  | `aarch64-macos.26.0` |
 | iOS    | on, embedded | on  | off | `aarch64-ios.26.0`, cpu `apple_a18` |
 | Linux  | off          | off | on  | `aarch64-linux-gnu`, `_GNU_SOURCE` |
+| Linux x86_64 | off    | off | on  | `x86_64-linux-gnu`, cpu `x86_64_v3`, `_GNU_SOURCE` |
 
 Only macOS is verified token-identical against CMake. iOS and Linux compile and
 link cleanly but have not been diffed on their own platforms — see **How to

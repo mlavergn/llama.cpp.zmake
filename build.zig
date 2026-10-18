@@ -25,6 +25,14 @@
 //! The Makefile drives all three; it owns the deployment targets and the one
 //! `-Dcpu` pin, none of which this file needs to know about.
 //!
+//! `-Dvulkan` adds ggml's Vulkan backend on any of them. It needs three things
+//! from outside the Zig toolchain, as CMake's build does: `glslc` to compile
+//! the shaders (`-Dglslc`, else the one on PATH), the Vulkan and SPIR-V
+//! headers (`-Dvulkan-include`, default `/usr/include` on Linux), and
+//! `libvulkan` to link (`-Dvulkan-lib` for a directory Zig does not search).
+//! Which shader extensions that `glslc` accepts decides which C++ compiles, so
+//! the same `glslc` and headers must build both sides of any comparison.
+//!
 //! # Steps
 //!
 //!   zig build            everything below
@@ -64,6 +72,7 @@ const Platform = enum {
     macos,
     ios,
     linux,
+    windows,
 
     /// Maps a resolved target onto a configuration this build supports.
     ///
@@ -78,6 +87,7 @@ const Platform = enum {
             .macos => .macos,
             .ios => .ios,
             .linux => .linux,
+            .windows => .windows,
             else => null,
         };
     }
@@ -88,7 +98,7 @@ const Platform = enum {
     /// defaults `GGML_METAL` and the Accelerate lookup off the same `APPLE`
     /// check (`ggml/CMakeLists.txt:96`, `ggml-cpu/CMakeLists.txt:60`).
     fn isApple(self: Platform) bool {
-        return self != .linux;
+        return self == .macos or self == .ios;
     }
 };
 
@@ -104,6 +114,17 @@ const quiet = [_][]const u8{
 
 const c_std = [_][]const u8{"-std=c11"} ++ quiet;
 const cxx_std = [_][]const u8{"-std=c++17"} ++ quiet;
+
+/// CMake's own dialects. `CMAKE_C_STANDARD 11` and `cxx_std_17` leave
+/// `C_EXTENSIONS`/`CXX_EXTENSIONS` at their default, on, so CMake passes
+/// `-std=gnu11` and `-std=gnu++17` everywhere. The other platforms keep the
+/// strict ones above, which they were verified with and which llamazig's
+/// bit-exact gates are calibrated against. Windows takes these, because MinGW's
+/// `<math.h>` withholds `M_PI` under `__STRICT_ANSI__` and
+/// `tools/mtmd/mtmd-audio.cpp` defines `_USE_MATH_DEFINES` only after its own
+/// header has already included `<cmath>`.
+const gnu_c_std = [_][]const u8{"-std=gnu11"} ++ quiet;
+const gnu_cxx_std = [_][]const u8{"-std=gnu++17"} ++ quiet;
 // ARC stays off: the Metal sources use manual reference counting and bridge
 // freely between void* and Objective-C object pointers.
 const objc_std = [_][]const u8{"-std=c11"} ++ quiet;
@@ -133,7 +154,7 @@ const apple_defines = [_][]const u8{
 };
 
 /// Required by the server tools and the server's router mode. CMake turns it
-/// on everywhere except Windows and the mobile/WASM targets, where spawning a
+/// on everywhere except the mobile and WASM targets, where spawning a
 /// subprocess is not sandbox-friendly (`CMakeLists.txt:104-110`).
 const subprocess_defines = [_][]const u8{"-DLLAMA_SUBPROCESS"};
 
@@ -145,6 +166,12 @@ const subprocess_defines = [_][]const u8{"-DLLAMA_SUBPROCESS"};
 /// token-identical without them, and adding a feature-test macro to a build
 /// that already matches can only move it.
 const linux_defines = [_][]const u8{"-D_GNU_SOURCE"};
+
+/// From `CMakeLists.txt:81` and `ggml/src/CMakeLists.txt:182`, both `if
+/// (WIN32)`. The target is MinGW (`x86_64-windows-gnu`), the only Windows ABI
+/// Zig ships a libc for; CMake's MinGW arms otherwise only pick static linking,
+/// which this build always does.
+const windows_defines = [_][]const u8{"-D_CRT_SECURE_NO_WARNINGS"};
 
 /// Scoped to the `llama` target only, as CMake does with
 /// `target_compile_definitions(llama PRIVATE ...)`. They must not be global:
@@ -176,7 +203,6 @@ const ggml_c_sources = [_][]const u8{
     "ggml/src/ggml-quants.c",
     "ggml/src/ggml-cpu/ggml-cpu.c",
     "ggml/src/ggml-cpu/quants.c",
-    "ggml/src/ggml-cpu/arch/arm/quants.c",
 };
 
 const ggml_cxx_sources = [_][]const u8{
@@ -200,8 +226,34 @@ const ggml_cxx_sources = [_][]const u8{
     "ggml/src/ggml-cpu/amx/amx.cpp",
     "ggml/src/ggml-cpu/amx/mmq.cpp",
     "ggml/src/ggml-cpu/llamafile/sgemm.cpp",
-    "ggml/src/ggml-cpu/arch/arm/repack.cpp",
 };
+
+/// The CPU backend's per-architecture sources, one pair per
+/// `GGML_SYSTEM_ARCH` (ggml/src/ggml-cpu/CMakeLists.txt:79, 240). On x86
+/// CMake adds `arch/x86/cpu-feats.cpp` only for `GGML_BACKEND_DL`, which is
+/// off here, and the `GGML_AVX*` definitions it pairs with the `-m` flags are
+/// read by that file alone; the kernels test the compiler's own `__AVX2__`
+/// and friends, which `-Dcpu` sets.
+const ArchSources = struct { c: []const []const u8, cxx: []const []const u8 };
+
+const ggml_arm_sources: ArchSources = .{
+    .c = &.{"ggml/src/ggml-cpu/arch/arm/quants.c"},
+    .cxx = &.{"ggml/src/ggml-cpu/arch/arm/repack.cpp"},
+};
+
+const ggml_x86_sources: ArchSources = .{
+    .c = &.{"ggml/src/ggml-cpu/arch/x86/quants.c"},
+    .cxx = &.{"ggml/src/ggml-cpu/arch/x86/repack.cpp"},
+};
+
+/// The arch sources for `arch`, or null for one this build has no list for.
+fn archSources(arch: std.Target.Cpu.Arch) ?ArchSources {
+    return switch (arch) {
+        .aarch64 => ggml_arm_sources,
+        .x86_64 => ggml_x86_sources,
+        else => null,
+    };
+}
 
 /// The Metal backend's C++ layer. Apple platforms only.
 const metal_cxx_sources = [_][]const u8{
@@ -307,11 +359,11 @@ const Config = struct {
     optimize: std.lang.Optimize,
     platform: Platform,
 
-    /// Apple SDK path. Null on Linux.
+    /// Apple SDK path. Null on Linux and Windows.
     sdk: ?[]const u8,
 
     /// A generated `zig libc` file pointing at the SDK's headers. Null on
-    /// Linux, where Zig ships glibc and needs no help.
+    /// Linux and Windows, where Zig ships glibc and MinGW and needs no help.
     ///
     /// Both Apple platforms need one, because both are named by an explicit
     /// `-Dtarget`. Zig only sets up the SDK include chain for a *native*
@@ -322,8 +374,9 @@ const Config = struct {
     /// flags. A libc file is the one knob that reaches it.
     libc_file: ?std.Build.LazyPath,
 
-    /// The bare C++ flags, without the platform's defines. For the vendored
-    /// libraries CMake compiles without ggml's defines.
+    /// The bare C and C++ flags, without the platform's defines. For the
+    /// vendored libraries CMake compiles without ggml's defines.
+    c_std: []const []const u8,
     cxx_std: []const []const u8,
 
     /// Compiler flags per language, with the platform's defines already
@@ -331,6 +384,9 @@ const Config = struct {
     c: []const []const u8,
     cxx: []const []const u8,
     objc: []const []const u8,
+
+    /// The Vulkan backend's configuration; null without `-Dvulkan`.
+    vulkan: ?Vulkan,
 };
 
 /// Declares the build graph.
@@ -350,29 +406,39 @@ pub fn build(b: *std.Build) !void {
     const optimize = b.standardOptimizeOption(.{});
     const platform = Platform.detect(target.result) orelse {
         std.log.err(
-            "no configuration for OS '{s}'; this build knows macos, ios, and linux",
+            "no configuration for OS '{s}'; this build knows macos, ios, linux, and windows",
             .{@tagName(target.result.os.tag)},
         );
         return error.UnsupportedTarget;
     };
-    // The only ggml arch sources listed are `arch/arm`. Anything else would
-    // link a libggml with no quant kernels rather than fail outright, so it is
-    // caught here instead.
-    if (target.result.cpu.arch != .aarch64) {
+    // ggml's arch sources are listed for arm64 and x86_64 only. Anything else
+    // would link a libggml with no quant kernels rather than fail outright,
+    // so it is caught here instead. x86_64 is Linux and Windows only: no
+    // Apple platform this build knows runs it.
+    if (archSources(target.result.cpu.arch) == null or
+        (target.result.cpu.arch == .x86_64 and platform.isApple()))
+    {
         std.log.err(
-            "no configuration for arch '{s}'; the ggml source list is arm64 only",
-            .{@tagName(target.result.cpu.arch)},
+            "no configuration for arch '{s}' on '{s}'; ggml's arch sources are arm64, and x86_64 on Linux and Windows",
+            .{ @tagName(target.result.cpu.arch), @tagName(target.result.os.tag) },
         );
         return error.UnsupportedTarget;
     }
 
     const sdk = if (platform.isApple()) try resolveAppleSdk(b, target.result) else null;
+    const vulkan = try configureVulkan(b, platform);
 
     var defs: std.ArrayList([]const u8) = .empty;
     try defs.appendSlice(b.allocator, &base_defines);
     if (platform.isApple()) try defs.appendSlice(b.allocator, &apple_defines);
     if (platform != .ios) try defs.appendSlice(b.allocator, &subprocess_defines);
     if (platform == .linux) try defs.appendSlice(b.allocator, &linux_defines);
+    if (platform == .windows) try defs.appendSlice(b.allocator, &windows_defines);
+    // Only `ggml-backend-reg.cpp` reads it, to register the backend.
+    if (vulkan != null) try defs.append(b.allocator, "-DGGML_USE_VULKAN");
+
+    const lang_c: []const []const u8 = if (platform == .windows) &gnu_c_std else &c_std;
+    const lang_cxx: []const []const u8 = if (platform == .windows) &gnu_cxx_std else &cxx_std;
 
     const cfg = Config{
         .target = target,
@@ -380,13 +446,15 @@ pub fn build(b: *std.Build) !void {
         .platform = platform,
         .sdk = sdk,
         .libc_file = if (sdk) |s| writeAppleLibcFile(b, s) else null,
-        .cxx_std = &cxx_std,
-        .c = try join(b, &c_std, defs.items),
-        .cxx = try join(b, &cxx_std, defs.items),
+        .c_std = lang_c,
+        .cxx_std = lang_cxx,
+        .c = try join(b, lang_c, defs.items),
+        .cxx = try join(b, lang_cxx, defs.items),
         .objc = try join(b, &objc_std, defs.items),
+        .vulkan = vulkan,
     };
 
-    const ggml = addGgml(b, cfg);
+    const ggml = try addGgml(b, cfg);
     const llama = try addLlama(b, cfg, ggml);
 
     const lib_step = b.step("lib", "Build ggml and libllama only");
@@ -512,14 +580,52 @@ fn addCommonIncludes(b: *std.Build, mod: *std.Build.Module) void {
     mod.addIncludePath(srcPath(b, "vendor"));
 }
 
+/// The shader extensions `ggml/src/ggml-vulkan/CMakeLists.txt:65-113` asks
+/// `glslc` about, in its order. Each one `glslc` accepts defines its macro for
+/// the shader generator and for `ggml-vulkan.cpp`, and both compile
+/// differently for it.
+const VulkanFeature = struct {
+    /// The extension named in `glslc`'s refusal.
+    extension: []const u8,
+    /// The test shader under `vulkan-shaders/feature-tests/`.
+    test_shader: []const u8,
+    /// The macro defined when `glslc` accepts it.
+    define: []const u8,
+};
+
+const vulkan_features = [_]VulkanFeature{
+    .{ .extension = "GL_KHR_cooperative_matrix", .test_shader = "coopmat.comp", .define = "GGML_VULKAN_COOPMAT_GLSLC_SUPPORT" },
+    .{ .extension = "GL_NV_cooperative_matrix2", .test_shader = "coopmat2.comp", .define = "GGML_VULKAN_COOPMAT2_GLSLC_SUPPORT" },
+    .{ .extension = "GL_NV_cooperative_matrix_decode_vector", .test_shader = "coopmat2_decode_vector.comp", .define = "GGML_VULKAN_COOPMAT2_DECODE_VECTOR_GLSLC_SUPPORT" },
+    .{ .extension = "GL_EXT_integer_dot_product", .test_shader = "integer_dot.comp", .define = "GGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT" },
+    .{ .extension = "GL_EXT_bfloat16", .test_shader = "bfloat16.comp", .define = "GGML_VULKAN_BFLOAT16_GLSLC_SUPPORT" },
+    .{ .extension = "GL_EXT_float_e2m1", .test_shader = "float_e2m1.comp", .define = "GGML_VULKAN_FLOAT_E2M1_GLSLC_SUPPORT" },
+    .{ .extension = "GL_EXT_float_e4m3", .test_shader = "float_e4m3.comp", .define = "GGML_VULKAN_FLOAT_E4M3_GLSLC_SUPPORT" },
+};
+
+/// The Vulkan shader sources and their generator, relative to the checkout.
+const vulkan_shaders_dir = "ggml/src/ggml-vulkan/vulkan-shaders";
+
+/// What `-Dvulkan` resolved to at configure time.
+const Vulkan = struct {
+    /// The `glslc` every shader is compiled with.
+    glslc: []const u8,
+    /// Directories holding `vulkan/` and `spirv/`, searched after libc's.
+    include_dirs: []const []const u8,
+    /// Extra directories to find `libvulkan` in.
+    lib_dirs: []const []const u8,
+    /// `-D` flags for the shader extensions `glslc` accepts.
+    features: []const []const u8,
+};
+
 /// Builds ggml with its CPU backend -- and, on Apple platforms, its Metal
-/// backend -- as one static archive.
+/// backend, and with `-Dvulkan` its Vulkan one -- as one static archive.
 ///
 /// CMake splits the backends so they can be loaded dynamically. With static
 /// linking and `GGML_BACKEND_DL` off that split carries no meaning:
 /// `ggml-backend-reg.cpp` calls each backend's registration function directly
 /// under an `#ifdef`, so one archive links identically.
-fn addGgml(b: *std.Build, cfg: Config) *std.Build.Step.Compile {
+fn addGgml(b: *std.Build, cfg: Config) !*std.Build.Step.Compile {
     const mod = baseModule(b, cfg);
 
     mod.addIncludePath(srcPath(b, "ggml/include"));
@@ -528,6 +634,9 @@ fn addGgml(b: *std.Build, cfg: Config) *std.Build.Step.Compile {
 
     mod.addCSourceFiles(.{ .root = b.path(src_root), .files = &ggml_c_sources, .flags = cfg.c });
     mod.addCSourceFiles(.{ .root = b.path(src_root), .files = &ggml_cxx_sources, .flags = cfg.cxx });
+    const arch = archSources(cfg.target.result.cpu.arch).?;
+    mod.addCSourceFiles(.{ .root = b.path(src_root), .files = arch.c, .flags = cfg.c });
+    mod.addCSourceFiles(.{ .root = b.path(src_root), .files = arch.cxx, .flags = cfg.cxx });
 
     if (cfg.platform.isApple()) {
         mod.addIncludePath(srcPath(b, "ggml/src/ggml-metal"));
@@ -542,7 +651,158 @@ fn addGgml(b: *std.Build, cfg: Config) *std.Build.Step.Compile {
         mod.linkFramework("Accelerate", .{});
     }
 
+    if (cfg.vulkan) |vk| try addVulkan(b, cfg, vk, mod);
+
     return addLibrary(b, cfg, "ggml", mod);
+}
+
+/// Reads the `-Dvulkan` options and asks `glslc` which shader extensions it
+/// accepts, at configure time, as `ggml-vulkan/CMakeLists.txt:34-57` does.
+///
+/// CMake's test is the one reproduced: an extension is supported unless
+/// `glslc`'s diagnostics contain `extension not supported: <name>` -- any
+/// other failure still counts as support. Locating `glslc` poisons Zig's
+/// configuration cache, so every build re-asks, and a `glslc` that changes
+/// between builds cannot leave stale answers.
+///
+/// Parameters:
+/// - `b`: the build graph, for its options, allocator and process spawning.
+/// - `platform`: decides the default header directory.
+///
+/// Return: null without `-Dvulkan`; otherwise the configuration, or an error
+/// when `glslc` or the headers cannot be found or a probe cannot run.
+fn configureVulkan(b: *std.Build, platform: Platform) !?Vulkan {
+    const enabled = b.option(bool, "vulkan", "Build ggml's Vulkan backend (needs glslc, the Vulkan and SPIR-V headers, and libvulkan)") orelse false;
+    const glslc_opt = b.option([]const u8, "glslc", "The glslc to compile the Vulkan shaders with (default: glslc on PATH)");
+    const include_opt = b.option([]const []const u8, "vulkan-include", "Directories holding vulkan/ and spirv/, searched after libc's headers (default on Linux: /usr/include)");
+    const lib_opt = b.option([]const []const u8, "vulkan-lib", "Extra directories to find libvulkan in");
+    if (!enabled) return null;
+
+    const glslc = glslc_opt orelse b.findProgram(.{ .names = &.{"glslc"} }) orelse {
+        std.log.err("-Dvulkan needs glslc: put it on PATH or pass -Dglslc=<path>", .{});
+        return error.GlslcNotFound;
+    };
+    const include_dirs: []const []const u8 = include_opt orelse if (platform == .linux)
+        &.{"/usr/include"}
+    else {
+        std.log.err("-Dvulkan on {s} needs -Dvulkan-include=<dir holding vulkan/ and spirv/>", .{@tagName(platform)});
+        return error.VulkanHeadersNotFound;
+    };
+
+    var features: std.ArrayList([]const u8) = .empty;
+    for (vulkan_features) |f| {
+        const rel = b.fmt("{s}/{s}/feature-tests/{s}", .{ src_root, vulkan_shaders_dir, f.test_shader });
+        b.dependOnFileContents(b.path(rel));
+        const test_shader = try b.root.joinString(b.allocator, rel);
+        // glslc's diagnostics go to stderr and it exits non-zero on the
+        // refusal, so the shell folds both into a successful stdout.
+        const out = switch (b.runFallible(&.{
+            "sh",                                                                                       "-c",
+            "\"$0\" -o - -fshader-stage=compute --target-env=vulkan1.3 \"$1\" 2>&1 >/dev/null; exit 0", glslc,
+            test_shader,
+        }, .{ .stderr_behavior = .ignore })) {
+            .success => |stdout| stdout,
+            else => {
+                std.log.err("could not run {s} on {s}", .{ glslc, test_shader });
+                return error.GlslcProbeFailed;
+            },
+        };
+        const refusal = b.fmt("extension not supported: {s}", .{f.extension});
+        if (std.mem.indexOf(u8, out, refusal) == null) {
+            try features.append(b.allocator, b.fmt("-D{s}", .{f.define}));
+        }
+    }
+
+    return .{
+        .glslc = glslc,
+        .include_dirs = include_dirs,
+        .lib_dirs = lib_opt orelse &.{},
+        .features = features.items,
+    };
+}
+
+/// Adds ggml's Vulkan backend to `mod`: the shader generator, the SPIR-V it
+/// embeds, and `ggml-vulkan.cpp`. `addCli` links `libvulkan`.
+///
+/// Replaces CMake's `ExternalProject` and custom commands
+/// (`ggml-vulkan/CMakeLists.txt:149-259`) with the same two passes of the
+/// same tool. `vulkan-shaders-gen` is upstream's generator, built for the host
+/// with the extension macros: run once with no source it writes
+/// `ggml-vulkan-shaders.hpp`, declaring every variant; run once per `.comp`
+/// with `--glslc` it compiles that file's variants and writes a `.cpp`
+/// holding their SPIR-V. Each run is a separate, cached step, so the 147
+/// shader files compile in parallel and only a changed one recompiles.
+///
+/// Every `.comp` and `.glsl` is an input of every run: a shader's includes
+/// are resolved by `glslc`, which Zig cannot see.
+///
+/// Parameters:
+/// - `b`: the build graph.
+/// - `cfg`: the platform's flags.
+/// - `vk`: what `configureVulkan` resolved.
+/// - `mod`: ggml's module, which gains the backend's sources and link.
+///
+/// Return: nothing; propagates directory-read failures.
+fn addVulkan(b: *std.Build, cfg: Config, vk: Vulkan, mod: *std.Build.Module) !void {
+    const gen_mod = b.createModule(.{
+        .target = b.graph.host,
+        .optimize = .fast,
+        .link_libc = true,
+        .link_libcpp = true,
+        .sanitize_c = .off,
+    });
+    gen_mod.addCSourceFile(.{
+        .file = srcPath(b, vulkan_shaders_dir ++ "/vulkan-shaders-gen.cpp"),
+        .flags = try join(b, &cxx_std, vk.features),
+    });
+    const gen = b.addExecutable(.{ .name = "vulkan-shaders-gen", .root_module = gen_mod });
+
+    var comp: std.ArrayList([]const u8) = .empty;
+    try appendGlob(b, &comp, vulkan_shaders_dir, ".comp");
+    var glsl: std.ArrayList([]const u8) = .empty;
+    try appendGlob(b, &glsl, vulkan_shaders_dir, ".glsl");
+
+    // Pass 1: the header, which names every variant.
+    const hdr_run = b.addRunArtifact(gen);
+    hdr_run.addArg("--output-dir");
+    _ = hdr_run.addOutputDirectoryArg("spv");
+    hdr_run.addArg("--target-hpp");
+    const header = hdr_run.addOutputFileArg("ggml-vulkan-shaders.hpp");
+    mod.addIncludePath(header.dirname());
+
+    // `-idirafter`, not `-I`: the header directory is usually `/usr/include`,
+    // which must not shadow the libc headers Zig supplies.
+    var vk_flags: std.ArrayList([]const u8) = .empty;
+    try vk_flags.appendSlice(b.allocator, cfg.cxx);
+    try vk_flags.appendSlice(b.allocator, vk.features);
+    for (vk.include_dirs) |dir| try vk_flags.appendSlice(b.allocator, &.{ "-idirafter", dir });
+
+    // Pass 2: one run per shader file, each writing that file's SPIR-V.
+    for (comp.items) |file| {
+        const run = b.addRunArtifact(gen);
+        run.addArgs(&.{ "--glslc", vk.glslc });
+        run.addArg("--source");
+        run.addFileArg(srcPath(b, file));
+        run.addArg("--output-dir");
+        _ = run.addOutputDirectoryArg("spv");
+        // Only its basename is used, for the generated `#include`.
+        run.addArgs(&.{ "--target-hpp", "ggml-vulkan-shaders.hpp" });
+        run.addArg("--target-cpp");
+        const cpp = run.addOutputFileArg(b.fmt("{s}.cpp", .{std.fs.path.basename(file)}));
+        for (comp.items) |f| run.addFileInput(srcPath(b, f));
+        for (glsl.items) |f| run.addFileInput(srcPath(b, f));
+        mod.addCSourceFile(.{ .file = cpp, .flags = cfg.cxx });
+    }
+
+    mod.addCSourceFiles(.{
+        .root = b.path(src_root),
+        .files = &.{"ggml/src/ggml-vulkan/ggml-vulkan.cpp"},
+        .flags = vk_flags.items,
+    });
+    // `libvulkan` is linked by the executable, in `addCli`, not here: Zig
+    // resolves a system library even for a static archive, which links
+    // nothing, and a machine that only builds the archive -- for a harness
+    // that links it itself -- need not have the loader installed.
 }
 
 /// Flattens one Metal kernel and returns the assembly stub that embeds it.
@@ -641,7 +901,7 @@ fn addCli(
                 "vendor/hash/xxhash/xxhash.c",
                 "vendor/hash/sha256/sha256.c",
             },
-            .flags = &c_std,
+            .flags = cfg.c_std,
         });
         break :blk addLibrary(b, cfg, "vendor-hash", mod);
     };
@@ -656,6 +916,8 @@ fn addCli(
             .files = &[_][]const u8{"vendor/cpp-httplib/httplib.cpp"},
             .flags = try join(b, cfg.cxx_std, &httplib_defines),
         });
+        // vendor/cpp-httplib/CMakeLists.txt:23, `WIN32 AND NOT MSVC`.
+        if (cfg.platform == .windows) mod.linkSystemLibrary("ws2_32", .{});
         break :blk addLibrary(b, cfg, "cpp-httplib", mod);
     };
 
@@ -791,6 +1053,10 @@ fn addCli(
         .flags = cfg.cxx,
     });
     mod.linkLibrary(cli_impl);
+    if (cfg.vulkan) |vk| {
+        for (vk.lib_dirs) |dir| mod.addLibraryPath(b.graph.cwdRelativePath(dir));
+        mod.linkSystemLibrary("vulkan", .{});
+    }
 
     return addExecutable(b, cfg, "llama-cli", mod);
 }
