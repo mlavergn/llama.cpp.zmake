@@ -689,6 +689,17 @@ fn configureVulkan(b: *std.Build, platform: Platform) !?Vulkan {
         return error.VulkanHeadersNotFound;
     };
 
+    // The probes below count any output but a refusal as support, so a
+    // `glslc` that cannot run at all would pass every one of them: make sure
+    // it runs first.
+    switch (b.runFallible(&.{ glslc, "--version" }, .{ .stderr_behavior = .ignore })) {
+        .success => {},
+        else => {
+            std.log.err("-Dvulkan: {s} does not run", .{glslc});
+            return error.GlslcNotFound;
+        },
+    }
+
     var features: std.ArrayList([]const u8) = .empty;
     for (vulkan_features) |f| {
         const rel = b.fmt("{s}/{s}/feature-tests/{s}", .{ src_root, vulkan_shaders_dir, f.test_shader });
