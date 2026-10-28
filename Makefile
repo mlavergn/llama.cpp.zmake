@@ -14,7 +14,7 @@
 .PHONY: clone build dist lib cli run clean distclean macos ios linux linux-x86_64 windows-x86_64
 
 # Pinned deliberately. A port against a moving target does not converge.
-LLAMA_CPP_TAG ?= v0.3.0
+LLAMA_CPP_TAG ?= v0.4.0
 
 # The platform targets: arm64 everywhere, and x86_64 on Linux and Windows.
 # build.zig derives its whole configuration -- backends, source lists,

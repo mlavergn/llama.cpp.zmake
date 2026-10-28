@@ -56,11 +56,19 @@ fn srcPath(b: *std.Build, sub: []const u8) std.Build.LazyPath {
     return b.path(b.fmt("{s}/{s}", .{ src_root, sub }));
 }
 
-/// Version reported by `ggml_version` and `llama_build_info`, matching what
-/// CMake derives from git.
-const version = "0.3.0";
-const commit = "c1d0e7a00";
-const build_number = 10621;
+/// What CMake configures `ggml-version.h`, `llama-version.h` and
+/// `build-info.cpp` with at the pinned release tag.
+///
+/// `version` is `LLAMA_VERSION` with `LLAMA_BUILD_IS_DEV` off, as for a
+/// release tag (CMakeLists.txt:6-21); `ggml_version` is ggml's own
+/// (ggml/CMakeLists.txt:6-31), which is not llama.cpp's. `commit` is
+/// `git rev-parse --short HEAD` and `build_number` the build tag's number
+/// (`git describe --tags --match 'b*'`), as cmake/build-info.cmake derives
+/// them.
+const version = "0.4.0";
+const ggml_version = "0.23.0";
+const commit = "5266f24da";
+const build_number = 10809;
 
 /// The platforms this build knows how to configure.
 ///
@@ -139,8 +147,6 @@ const base_defines = [_][]const u8{
     // repack.cpp is unreachable. This build is the bit-exact reference
     // for llamazig's ops-diff/node-diff/parity-port, so it has to match.
     "-DGGML_USE_CPU_REPACK",
-    "-DGGML_VERSION=\"" ++ version ++ "\"",
-    "-DGGML_COMMIT=\"" ++ commit ++ "\"",
 };
 
 /// The Metal backend and the Accelerate BLAS, from `ggml/CMakeLists.txt:96`
@@ -172,15 +178,6 @@ const linux_defines = [_][]const u8{"-D_GNU_SOURCE"};
 /// Zig ships a libc for; CMake's MinGW arms otherwise only pick static linking,
 /// which this build always does.
 const windows_defines = [_][]const u8{"-D_CRT_SECURE_NO_WARNINGS"};
-
-/// Scoped to the `llama` target only, as CMake does with
-/// `target_compile_definitions(llama PRIVATE ...)`. They must not be global:
-/// `build-info.cpp` declares variables with these exact names, and a macro of
-/// the same name breaks it.
-const llama_defines = [_][]const u8{
-    "-DLLAMA_VERSION=\"" ++ version ++ "\"",
-    "-DLLAMA_COMMIT=\"" ++ commit ++ "\"",
-};
 
 /// cpp-httplib's tuning, from vendor/cpp-httplib/CMakeLists.txt:29.
 const httplib_defines = [_][]const u8{
@@ -216,6 +213,7 @@ const ggml_cxx_sources = [_][]const u8{
     "ggml/src/ggml-backend-reg.cpp",
     "ggml/src/ggml-cpu/ggml-cpu.cpp",
     "ggml/src/ggml-cpu/repack.cpp",
+    "ggml/src/ggml-cpu/iqp.cpp",
     "ggml/src/ggml-cpu/hbm.cpp",
     "ggml/src/ggml-cpu/traits.cpp",
     "ggml/src/ggml-cpu/binary-ops.cpp",
@@ -291,7 +289,8 @@ const llama_sources = [_][]const u8{
     "src/llama-kv-cache-dsa.cpp",       "src/llama-kv-cache-dsa-iswa.cpp",
     "src/llama-kv-cache-msa.cpp",       "src/llama-kv-cache-dsv4.cpp",
     "src/llama-memory.cpp",             "src/llama-memory-hybrid.cpp",
-    "src/llama-memory-hybrid-iswa.cpp", "src/llama-memory-recurrent.cpp",
+    "src/llama-memory-hybrid-iswa.cpp", "src/llama-memory-hybrid-idx.cpp",
+    "src/llama-memory-recurrent.cpp",
     "src/llama-mmap.cpp",               "src/llama-model-loader.cpp",
     "src/llama-model-saver.cpp",        "src/llama-model.cpp",
     "src/llama-quant.cpp",              "src/llama-sampler.cpp",
@@ -631,6 +630,11 @@ fn addGgml(b: *std.Build, cfg: Config) !*std.Build.Step.Compile {
     mod.addIncludePath(srcPath(b, "ggml/include"));
     mod.addIncludePath(srcPath(b, "ggml/src"));
     mod.addIncludePath(srcPath(b, "ggml/src/ggml-cpu"));
+    // ggml/src/CMakeLists.txt:216, configure_file(ggml-version.h.in).
+    mod.addConfigHeader(b.addConfigHeader(.{
+        .style = .{ .cmake = srcPath(b, "ggml/src/ggml-version.h.in") },
+        .include_path = "ggml-version.h",
+    }, .{ .GGML_VERSION = ggml_version, .GGML_BUILD_COMMIT = commit }));
 
     mod.addCSourceFiles(.{ .root = b.path(src_root), .files = &ggml_c_sources, .flags = cfg.c });
     mod.addCSourceFiles(.{ .root = b.path(src_root), .files = &ggml_cxx_sources, .flags = cfg.cxx });
@@ -860,6 +864,11 @@ fn addLlama(b: *std.Build, cfg: Config, ggml: *std.Build.Step.Compile) !*std.Bui
     addCommonIncludes(b, mod);
     // Private to this target; see addCommonIncludes.
     mod.addIncludePath(srcPath(b, "src"));
+    // src/CMakeLists.txt:55, configure_file(llama-version.h.in).
+    mod.addConfigHeader(b.addConfigHeader(.{
+        .style = .{ .cmake = srcPath(b, "src/llama-version.h.in") },
+        .include_path = "llama-version.h",
+    }, .{ .LLAMA_VERSION = version, .LLAMA_BUILD_COMMIT = commit }));
 
     var files: std.ArrayList([]const u8) = .empty;
     try files.appendSlice(b.allocator, &llama_sources);
@@ -868,7 +877,7 @@ fn addLlama(b: *std.Build, cfg: Config, ggml: *std.Build.Step.Compile) !*std.Bui
     mod.addCSourceFiles(.{
         .root = b.path(src_root),
         .files = files.items,
-        .flags = try join(b, cfg.cxx, &llama_defines),
+        .flags = cfg.cxx,
     });
     mod.linkLibrary(ggml);
 
@@ -932,45 +941,21 @@ fn addCli(
         break :blk addLibrary(b, cfg, "cpp-httplib", mod);
     };
 
-    // llama-common-base: just the generated build-info.cpp. CMake produces it
-    // with configure_file from build-info.cpp.in; this writes it directly.
-    const build_info = b.addWriteFiles().add("build-info.cpp", b.fmt(
-        \\#include "build-info.h"
-        \\
-        \\#include <cstdio>
-        \\#include <string>
-        \\
-        \\int LLAMA_BUILD_NUMBER = {d};
-        \\char const * LLAMA_COMMIT = "{s}";
-        \\char const * LLAMA_COMPILER = "Zig {s} clang";
-        \\char const * LLAMA_BUILD_TARGET = "{s}";
-        \\
-        \\int llama_build_number(void) {{ return LLAMA_BUILD_NUMBER; }}
-        \\const char * llama_commit(void) {{ return LLAMA_COMMIT; }}
-        \\const char * llama_compiler(void) {{ return LLAMA_COMPILER; }}
-        \\const char * llama_build_target(void) {{ return LLAMA_BUILD_TARGET; }}
-        \\
-        \\const char * llama_build_info(void) {{
-        \\    static std::string s = "b" + std::to_string(LLAMA_BUILD_NUMBER) + "-" + LLAMA_COMMIT;
-        \\    return s.c_str();
-        \\}}
-        \\
-        \\void llama_print_build_info(const char * llama_version) {{
-        \\    fprintf(stderr, "version: %s (build %d, commit %s)\n", llama_version, llama_build_number(), llama_commit());
-        \\    fprintf(stderr, "built with %s for %s\n", LLAMA_COMPILER, LLAMA_BUILD_TARGET);
-        \\}}
-        \\
-    , .{
-        build_number,
-        commit,
-        builtin.zig_version_string,
-        // The resolved target is only known at configure time, so the triple
-        // is formatted rather than concatenated at comptime.
-        b.fmt("{s}-{s}", .{
+    // llama-common-base: just build-info.cpp, configured from upstream's
+    // build-info.cpp.in as common/CMakeLists.txt does. The resolved target is
+    // only known at configure time, so the triple is formatted.
+    const build_info = b.addConfigHeader(.{
+        .style = .{ .cmake = srcPath(b, "common/build-info.cpp.in") },
+        .include_path = "build-info.cpp",
+    }, .{
+        .LLAMA_BUILD_NUMBER = build_number,
+        .LLAMA_BUILD_COMMIT = commit,
+        .BUILD_COMPILER = b.fmt("Zig {s} clang", .{builtin.zig_version_string}),
+        .BUILD_TARGET = b.fmt("{s}-{s}", .{
             @tagName(cfg.target.result.cpu.arch),
             @tagName(cfg.target.result.os.tag),
         }),
-    }));
+    }).getOutputFile();
 
     const common_base = blk: {
         const mod = baseModule(b, cfg);
