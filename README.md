@@ -26,7 +26,7 @@ checkout replaced without reconciling anything.
 ## Use
 
 ```sh
-make clone     # fetch llama.cpp at v0.4.0
+make clone     # fetch llama.cpp at v0.4.1
 make           # build everything for the host
 make cli       # llama-cli, optimized, then chat with $(MODEL)
 make lib       # ggml and libllama only

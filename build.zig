@@ -65,10 +65,10 @@ fn srcPath(b: *std.Build, sub: []const u8) std.Build.LazyPath {
 /// `git rev-parse --short HEAD` and `build_number` the build tag's number
 /// (`git describe --tags --match 'b*'`), as cmake/build-info.cmake derives
 /// them.
-const version = "0.4.0";
-const ggml_version = "0.23.0";
-const commit = "5266f24da";
-const build_number = 10809;
+const version = "0.4.1";
+const ggml_version = "0.24.0";
+const commit = "b29c606e2";
+const build_number = 10964;
 
 /// The platforms this build knows how to configure.
 ///
@@ -258,6 +258,7 @@ const metal_cxx_sources = [_][]const u8{
     "ggml/src/ggml-metal/ggml-metal.cpp",
     "ggml/src/ggml-metal/ggml-metal-device.cpp",
     "ggml/src/ggml-metal/ggml-metal-common.cpp",
+    "ggml/src/ggml-metal/ggml-metal-fusion.cpp",
     "ggml/src/ggml-metal/ggml-metal-ops.cpp",
     "ggml/src/ggml-metal/ggml-metal-tuning.cpp",
 };
@@ -306,7 +307,8 @@ const common_sources = [_][]const u8{
     "common/debug.cpp",                    "common/download.cpp",
     "common/fit.cpp",                      "common/hf-cache.cpp",
     "common/imatrix-loader.cpp",           "common/json-schema-to-grammar.cpp",
-    "common/json.cpp",                     "common/llguidance.cpp",
+    "common/json-schema.cpp",              "common/json.cpp",
+    "common/llguidance.cpp",
     "common/log.cpp",                      "common/ngram-cache.cpp",
     "common/ngram-map.cpp",                "common/ngram-mod.cpp",
     "common/peg-parser.cpp",               "common/preset.cpp",
@@ -316,6 +318,15 @@ const common_sources = [_][]const u8{
     "common/jinja/lexer.cpp",              "common/jinja/parser.cpp",
     "common/jinja/runtime.cpp",            "common/jinja/value.cpp",
     "common/jinja/string.cpp",             "common/jinja/caps.cpp",
+    // common/parsers/sources.cmake's LLAMA_CHAT_PARSERS_SOURCES
+    "common/parsers/parsers.cpp",          "common/parsers/cohere2moe.cpp",
+    "common/parsers/deepseek.cpp",         "common/parsers/functionary-v3-2.cpp",
+    "common/parsers/gemma4.cpp",           "common/parsers/gigachat-v3.cpp",
+    "common/parsers/gpt-oss.cpp",          "common/parsers/kimi-k2.cpp",
+    "common/parsers/kimi-k3.cpp",          "common/parsers/lfm2.cpp",
+    "common/parsers/minicpm5.cpp",         "common/parsers/minimax-m3.cpp",
+    "common/parsers/ministral3.cpp",       "common/parsers/muse-glimmer.cpp",
+    "common/parsers/qwen3-coder.cpp",
 };
 
 /// mtmd's own sources. The per-architecture files under `models/` are globbed,
