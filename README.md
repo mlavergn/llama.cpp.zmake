@@ -31,6 +31,9 @@ make           # build everything for the host
 make cli       # llama-cli, optimized, then chat with $(MODEL)
 make lib       # ggml and libllama only
 make dist      # optimized
+make ui        # build the web UI with npm into .ui/dist
+make server    # llama-server, the UI embedded when .ui/dist exists
+make web       # both, then serve $(MODEL) on $(PORT) (default 8080)
 make run ARGS="-m model.gguf -ngl 99 -p 'hello' -st"
 ```
 
@@ -94,20 +97,49 @@ platform, and until one is, treat them as unproven.
 The other ~90 CMake binaries — tests, benchmarks, and the other tools. They are
 ordinary additions to the same pattern.
 
-## The web UI is stubbed
+## The web UI
 
-`llama-cli` links `llama-server-impl`, which links `llama-ui`. Under CMake that
-target runs a SvelteKit/npm build and then compiles a host tool to turn the
-output into a C++ asset array. Driving npm from the build graph is possible but
-was not the point, so `zig/ui-stub/` supplies the same interface with zero
-assets.
+`llama-server-impl` links `llama-ui`. Under CMake that target provisions the
+SvelteKit bundle -- `npm ci` and `npm run build` under `LLAMA_BUILD_UI`, or a
+download from a Hugging Face bucket under `LLAMA_USE_PREBUILT_UI` -- and
+`scripts/ui-assets.cmake`'s `emit_files` writes every file of it into
+`tools/ui/ui.h.in` and `ui.cpp.in` as byte arrays.
 
-`LLAMA_UI_HAS_ASSETS` is deliberately left undefined, which switches
-`server-http.cpp` to its no-assets path. The declarations are still required,
-because that file calls `llama_ui_get_assets()` outside the guard.
+Here the two halves are split:
 
-`llama-cli` is unaffected — it never serves a web UI. `llama-server` would
-build and run but serve none.
+- **`make ui`** is the npm half. It copies `llama.cpp/tools/ui` to `.ui/src`
+  (npm writes `node_modules` and `.svelte-kit` beside its sources, and the
+  checkout is read-only), runs `npm ci` and `npm run build` with
+  `LLAMA_UI_OUT_DIR` and the build number in the environment as CMake does,
+  and leaves the bundle in `.ui/dist`. Needs node and npm; nothing else does.
+- **`zig build server -Dui=.ui/dist`** embeds it: `zig/ui_embed.zig` is
+  `emit_files` -- sorted file list, `_gzip/` excluded, the required-asset
+  check, gzip with a zero timestamp (`-Dui-gzip`, default on, as
+  `LLAMA_UI_GZIP`), ETag = quoted SHA-256 of the embedded bytes, the same
+  MIME table, the same templates. `make server` passes `-Dui` when the bundle
+  exists; `make web` builds both and serves `$(MODEL)` on `$(PORT)`.
+
+Without `-Dui`, `zig/ui-stub/` supplies the same interface with zero assets
+and `LLAMA_UI_HAS_ASSETS` undefined, which switches `server-http.cpp` to its
+no-assets path; the declarations are still required, because that file calls
+`llama_ui_get_assets()` outside the guard. `llama-cli` always builds that way
+-- it never serves a UI.
+
+Three things to know:
+
+- **The gzip bytes are this compressor's, not libarchive's**, so a gzip
+  build's ETags differ from a CMake build's. Nothing compares them.
+- **`npm run build` is not reproducible.** SvelteKit stamps
+  `_app/version.json` with the build time, and the hashed bundle names,
+  `index.html` and `sw.js` follow it. Two builds compared byte for byte must
+  embed the same `.ui/dist`, not two runs of `make ui`.
+- **Every directory of the bundle is a configure input.** A rebuilt bundle
+  renames `_app/immutable/bundle.*.js`; with only the top directory watched,
+  Zig 0.17 reused the old graph and failed on the vanished file.
+
+Verified: all 70 assets of a build served by `llama-server` and gunzipped
+equal the bundle's files; `If-None-Match` (plain and `W/`) gives 304; a
+client without `Accept-Encoding: gzip` gets upstream's 415.
 
 ## Fidelity notes
 

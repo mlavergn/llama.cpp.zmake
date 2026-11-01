@@ -8,9 +8,11 @@
 //! Everything `llama-cli` needs, which is most of the library surface:
 //! ggml with its CPU backend and, on Apple platforms, its Metal backend;
 //! libllama, the vendored libraries, `common`, `mtmd`, and the server
-//! implementation that the CLI links against. Not built: the other ~90 CMake
-//! binaries (tests, benchmarks, the other tools) and the SvelteKit web UI --
-//! see `zig/ui-stub/ui.h`.
+//! implementation that the CLI links against, and `llama-server` over it
+//! (`zig build server`). The SvelteKit web UI is embedded under `-Dui=<dist>`
+//! (`make ui` builds it with npm; `zig/ui_embed.zig` embeds it); without it,
+//! `zig/ui-stub` supplies an empty table. Not built: the other ~90 CMake
+//! binaries (tests, benchmarks, the other tools).
 //!
 //! # Configuration
 //!
@@ -38,6 +40,7 @@
 //!   zig build            everything below
 //!   zig build cli        llama-cli
 //!   zig build lib        ggml + libllama only
+//!   zig build server     llama-server; -Dui=.ui/dist embeds the web UI
 //!   zig build run -- ... build and run llama-cli
 
 const std = @import("std");
@@ -397,6 +400,15 @@ const Config = struct {
 
     /// The Vulkan backend's configuration; null without `-Dvulkan`.
     vulkan: ?Vulkan,
+
+    /// The built web UI to embed (`-Dui`, a SvelteKit `dist` directory,
+    /// relative to the build root or absolute); null for `zig/ui-stub`'s
+    /// empty table.
+    ui: ?[]const u8,
+
+    /// Whether the embedded UI is gzip-compressed (`-Dui-gzip`, upstream's
+    /// `LLAMA_UI_GZIP`, default on).
+    ui_gzip: bool,
 };
 
 /// Declares the build graph.
@@ -462,6 +474,8 @@ pub fn build(b: *std.Build) !void {
         .cxx = try join(b, lang_cxx, defs.items),
         .objc = try join(b, &objc_std, defs.items),
         .vulkan = vulkan,
+        .ui = b.option([]const u8, "ui", "Embed the web UI built in this directory (a SvelteKit dist; `make ui` writes .ui/dist). Default: no UI"),
+        .ui_gzip = b.option(bool, "ui-gzip", "gzip-compress the embedded web UI, as upstream's LLAMA_UI_GZIP (default true)") orelse true,
     };
 
     const ggml = try addGgml(b, cfg);
@@ -471,11 +485,16 @@ pub fn build(b: *std.Build) !void {
     lib_step.dependOn(&b.addInstallArtifact(ggml, .{}).step);
     lib_step.dependOn(&b.addInstallArtifact(llama, .{}).step);
 
-    const cli = try addCli(b, cfg, ggml, llama);
+    const exes = try addCli(b, cfg, ggml, llama);
+    const cli = exes.cli;
     b.installArtifact(cli);
 
     const cli_step = b.step("cli", "Build llama-cli");
     cli_step.dependOn(&b.addInstallArtifact(cli, .{}).step);
+
+    // Not part of the default step: llama-cli is this build's deliverable.
+    const server_step = b.step("server", "Build llama-server (with the web UI under -Dui)");
+    server_step.dependOn(&b.addInstallArtifact(exes.server, .{}).step);
 
     const run = b.addRunArtifact(cli);
     run.step.dependOn(b.getInstallStep());
@@ -906,7 +925,7 @@ fn addCli(
     cfg: Config,
     ggml: *std.Build.Step.Compile,
     llama: *std.Build.Step.Compile,
-) !*std.Build.Step.Compile {
+) !Executables {
     // vendor::hash, needed by mtmd.
     const hash = blk: {
         const mod = baseModule(b, cfg);
@@ -1005,14 +1024,21 @@ fn addCli(
         break :blk addLibrary(b, cfg, "llama-common", mod);
     };
 
-    // The web UI, stubbed. See zig/ui-stub/ui.h.
+    // The web UI: upstream's bundle embedded under -Dui, else the stub.
+    const ui_headers = if (cfg.ui) |dist| try embedUi(b, cfg, dist) else null;
+    const ui_include = if (ui_headers) |h| h.dir else b.path("zig/ui-stub");
     const ui = blk: {
         const mod = baseModule(b, cfg);
-        mod.addIncludePath(b.path("zig/ui-stub"));
-        mod.addCSourceFiles(.{
-            .files = &[_][]const u8{"zig/ui-stub/ui.cpp"},
-            .flags = cfg.cxx_std,
-        });
+        mod.addIncludePath(ui_include);
+        if (ui_headers) |h| {
+            // tools/ui/CMakeLists.txt:65, add_library(llama-ui ui.cpp) with cxx_std_17.
+            mod.addCSourceFile(.{ .file = h.cpp, .flags = cfg.cxx_std });
+        } else {
+            mod.addCSourceFiles(.{
+                .files = &[_][]const u8{"zig/ui-stub/ui.cpp"},
+                .flags = cfg.cxx_std,
+            });
+        }
         break :blk addLibrary(b, cfg, "llama-ui", mod);
     };
 
@@ -1032,7 +1058,7 @@ fn addCli(
         addCommonIncludes(b, mod);
         mod.addIncludePath(srcPath(b, "tools/mtmd"));
         mod.addIncludePath(srcPath(b, "tools/server"));
-        mod.addIncludePath(b.path("zig/ui-stub"));
+        mod.addIncludePath(ui_include);
         mod.addCSourceFiles(.{ .root = b.path(src_root), .files = &server_impl_sources, .flags = cfg.cxx });
         mod.linkLibrary(server_context);
         mod.linkLibrary(ui);
@@ -1060,12 +1086,106 @@ fn addCli(
         .flags = cfg.cxx,
     });
     mod.linkLibrary(cli_impl);
+    linkVulkan(b, cfg, mod);
+
+    // tools/server/CMakeLists.txt:72, llama-server: main.cpp over llama-server-impl.
+    const server = blk: {
+        const smod = baseModule(b, cfg);
+        addCommonIncludes(b, smod);
+        smod.addIncludePath(srcPath(b, "tools/server"));
+        smod.addCSourceFiles(.{
+            .root = b.path(src_root),
+            .files = &[_][]const u8{"tools/server/main.cpp"},
+            .flags = cfg.cxx,
+        });
+        smod.linkLibrary(server_impl);
+        linkVulkan(b, cfg, smod);
+        break :blk addExecutable(b, cfg, "llama-server", smod);
+    };
+
+    return .{ .cli = addExecutable(b, cfg, "llama-cli", mod), .server = server };
+}
+
+/// What `addCli` builds: the CLI, and the server over the same libraries.
+const Executables = struct {
+    cli: *std.Build.Step.Compile,
+    server: *std.Build.Step.Compile,
+};
+
+/// Links `libvulkan` into an executable when the Vulkan backend is on.
+fn linkVulkan(b: *std.Build, cfg: Config, mod: *std.Build.Module) void {
     if (cfg.vulkan) |vk| {
         for (vk.lib_dirs) |dir| mod.addLibraryPath(b.graph.cwdRelativePath(dir));
         mod.linkSystemLibrary("vulkan", .{});
     }
+}
 
-    return addExecutable(b, cfg, "llama-cli", mod);
+/// The generated `ui.h` and `ui.cpp`.
+const UiHeaders = struct {
+    /// The directory holding `ui.h`, for the include path.
+    dir: std.Build.LazyPath,
+    cpp: std.Build.LazyPath,
+};
+
+/// Embeds a built web UI, as `scripts/ui-assets.cmake`'s `emit_files` does.
+///
+/// Upstream's CMake first provisions the SvelteKit bundle -- `npm ci` and
+/// `npm run build` under `LLAMA_BUILD_UI`, or a download under
+/// `LLAMA_USE_PREBUILT_UI` -- then writes every file of it into
+/// `tools/ui/ui.h.in` and `ui.cpp.in` as byte arrays. The npm half is the
+/// Makefile's `ui` target here; `zig/ui_embed.zig` does the rest.
+///
+/// Parameters:
+/// - `b`: the build graph.
+/// - `cfg`: for `ui_gzip`.
+/// - `dist_path`: the bundle's directory, relative to the build root or
+///   absolute.
+///
+/// Return: the generated header directory and source; propagates
+/// directory-read failures.
+fn embedUi(b: *std.Build, cfg: Config, dist_path: []const u8) !UiHeaders {
+    const dist: std.Build.LazyPath = if (std.fs.path.isAbsolute(dist_path))
+        .{ .cwd_relative = dist_path }
+    else
+        b.path(dist_path);
+    const tool = b.addExecutable(.{
+        .name = "ui_embed",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("zig/ui_embed.zig"),
+            .target = b.graph.host,
+            // gzip and the hex dump of ~10 MB are slow in Debug.
+            .optimize = .ReleaseFast,
+        }),
+    });
+    const run = b.addRunArtifact(tool);
+    run.addDirectoryArg(dist);
+    run.addFileArg(srcPath(b, "tools/ui/ui.h.in"));
+    run.addFileArg(srcPath(b, "tools/ui/ui.cpp.in"));
+    run.addArg(if (cfg.ui_gzip) "1" else "0");
+    const h = run.addOutputFileArg("ui.h");
+    const cpp = run.addOutputFileArg("ui.cpp");
+
+    // A directory argument is not hashed by its contents: name every file,
+    // so a rebuilt bundle re-runs the tool. And reconfigure when any
+    // directory's listing changes (see appendGlob) -- every one, not just the
+    // top: each `npm run build` renames the hashed bundles under
+    // `_app/immutable/`, and a graph reused over the old listing fails on a
+    // file that no longer exists.
+    b.dependOnDirectoryContents(dist);
+    var handle = try b.root.openDir(b.graph.io, dist_path, .{ .iterate = true });
+    defer handle.close(b.graph.io);
+    var walker = try handle.walk(b.allocator);
+    defer walker.deinit();
+    while (try walker.next(b.graph.io)) |entry| {
+        const rel = b.dupe(entry.path);
+        if (entry.kind == .directory) {
+            b.dependOnDirectoryContents(dist.path(b, rel));
+            continue;
+        }
+        run.addFileInput(dist.path(b, rel));
+    }
+
+    return .{ .dir = h.dirname(), .cpp = cpp };
 }
 
 /// Appends every file in `dir` with the given extension, as CMake's

@@ -5,3 +5,6 @@ zig-out
 # The llama.cpp sources, fetched by `make clone`. Not vendored here: this
 # repository is the build system, not a fork.
 llama.cpp
+
+# The web UI build (`make ui`): staged sources, node_modules, dist.
+.ui

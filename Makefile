@@ -11,7 +11,7 @@
 
 .DEFAULT_GOAL := build
 
-.PHONY: clone build dist lib cli run clean distclean macos ios linux linux-x86_64 windows-x86_64
+.PHONY: clone build dist lib cli run clean distclean macos ios linux linux-x86_64 windows-x86_64 ui server web
 
 # Pinned deliberately. A port against a moving target does not converge.
 LLAMA_CPP_TAG ?= v0.4.1
@@ -62,7 +62,12 @@ IOS_CPU ?= apple_a18
 RELEASE ?= --release=fast
 
 # The model `make cli` chats with.
-MODEL ?= Qwen3.5-2B-Q4_K_M.gguf
+#
+# Looked for here first, then in the parent directory -- where it is when this
+# checkout sits inside llamazig. A name given on the command line, e.g.
+# MODEL=../Qwen3-0.6B-Q8_0.gguf, is used as is.
+MODEL_NAME ?= Qwen3.5-2B-Q4_K_M.gguf
+MODEL ?= $(or $(firstword $(wildcard $(MODEL_NAME) ../$(MODEL_NAME))),$(MODEL_NAME))
 
 # VULKAN=1 adds ggml's Vulkan backend to any target below, e.g.
 #   make lib VULKAN=1
@@ -129,6 +134,43 @@ linux-x86_64:
 # same arch/x86 sources and X86_CPU as Linux; CPU backend only.
 windows-x86_64:
 	zig build cli $(RELEASE) -Dtarget=$(WINDOWS_X86_TARGET) -Dcpu=$(X86_CPU) -p zig-out/windows-x86_64 $(VULKAN_FLAGS)
+
+# The web UI. upstream's CMake (scripts/ui-assets.cmake, LLAMA_BUILD_UI)
+# copies tools/ui to its build tree, runs `npm ci` and `npm run build` there
+# with the output directory and build number in the environment, then embeds
+# the result. This is the npm half, staged in .ui/ so the checkout is never
+# written to (npm writes node_modules and .svelte-kit beside its sources);
+# `zig build -Dui=.ui/dist` embeds it (zig/ui_embed.zig). Needs node and npm.
+UI_DIR       ?= .ui
+UI_BUILD_NUM ?= b$(shell sed -n 's/^const build_number = \([0-9]*\);/\1/p' build.zig)
+PORT         ?= 8080
+
+ui:
+	mkdir -p $(UI_DIR)
+	rsync -a --delete --exclude node_modules --exclude .svelte-kit --exclude dist llama.cpp/tools/ui/ $(UI_DIR)/src/
+	cd $(UI_DIR)/src && npm ci --no-audit --no-fund
+	rm -rf $(UI_DIR)/dist
+	cd $(UI_DIR)/src && LLAMA_UI_OUT_DIR=$(abspath $(UI_DIR))/dist LLAMA_UI_VERSION=$(UI_BUILD_NUM) \
+		LLAMA_BUILD_NUMBER=$(UI_BUILD_NUM) npm run build
+	test -f $(UI_DIR)/dist/index.html
+
+# llama-server, with the web UI embedded once `make ui` has built it and
+# without one otherwise.
+server:
+	zig build server $(RELEASE) $(VULKAN_FLAGS) $(if $(wildcard $(UI_DIR)/dist/index.html),-Dui=$(UI_DIR)/dist)
+
+# Build the UI and the server, serve $(MODEL) on $(PORT), and open the
+# default browser on it once /health answers 200 (it answers 503 while the
+# model loads). The server runs in the foreground; Ctrl-C stops it. The
+# waiter gives up after five minutes or as soon as the server has exited.
+OPEN ?= $(if $(filter Darwin,$(shell uname -s)),open,xdg-open)
+
+web: ui server
+	@( for i in $$(seq 1 600); do \
+	     curl -sf -o /dev/null http://127.0.0.1:$(PORT)/health && { $(OPEN) http://127.0.0.1:$(PORT)/; exit 0; }; \
+	     kill -0 $$$$ 2>/dev/null || exit 0; sleep 0.5; \
+	   done ) & \
+	exec ./zig-out/bin/llama-server -m $(MODEL) --port $(PORT) $(ARGS)
 
 # Run llama-cli. Pass arguments with ARGS, e.g.
 #   make run ARGS="-m model.gguf -p 'hello' -ngl 99"
