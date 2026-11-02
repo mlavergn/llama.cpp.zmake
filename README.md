@@ -26,7 +26,7 @@ checkout replaced without reconciling anything.
 ## Use
 
 ```sh
-make clone     # fetch llama.cpp at v0.4.1
+make clone     # fetch llama.cpp at v0.5.0
 make           # build everything for the host
 make cli       # llama-cli, optimized, then chat with $(MODEL)
 make lib       # ggml and libllama only
@@ -75,8 +75,8 @@ needs: `glslc` (`-Dglslc`, else the one on `PATH`), the Vulkan and SPIR-V
 headers (`-Dvulkan-include`, default `/usr/include` on Linux), and `libvulkan`
 to link `llama-cli`. `build.zig` asks `glslc` which shader extensions it
 accepts, as `ggml-vulkan/CMakeLists.txt` does, and builds upstream's own
-`vulkan-shaders-gen` to compile the 147 shader files -- 1,440 variants with
-no optional extension, 1,980 with all of them. Those answers and the header
+`vulkan-shaders-gen` to compile the 154 shader files -- 1,119 variants with
+no optional extension, 1,541 with all of them (counted at v0.5.0). Those answers and the header
 version decide which C++ compiles, so two builds compared on bits must use
 the same `glslc` and headers. Added for llamazig's Vulkan port under an
 explicit grant.

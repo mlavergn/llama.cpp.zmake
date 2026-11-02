@@ -68,10 +68,10 @@ fn srcPath(b: *std.Build, sub: []const u8) std.Build.LazyPath {
 /// `git rev-parse --short HEAD` and `build_number` the build tag's number
 /// (`git describe --tags --match 'b*'`), as cmake/build-info.cmake derives
 /// them.
-const version = "0.4.1";
-const ggml_version = "0.24.0";
-const commit = "b29c606e2";
-const build_number = 10964;
+const version = "0.5.0";
+const ggml_version = "0.25.1";
+const commit = "7fe450e19";
+const build_number = 11146;
 
 /// The platforms this build knows how to configure.
 ///
@@ -326,10 +326,10 @@ const common_sources = [_][]const u8{
     "common/parsers/deepseek.cpp",         "common/parsers/functionary-v3-2.cpp",
     "common/parsers/gemma4.cpp",           "common/parsers/gigachat-v3.cpp",
     "common/parsers/gpt-oss.cpp",          "common/parsers/kimi-k2.cpp",
-    "common/parsers/kimi-k3.cpp",          "common/parsers/lfm2.cpp",
-    "common/parsers/minicpm5.cpp",         "common/parsers/minimax-m3.cpp",
-    "common/parsers/ministral3.cpp",       "common/parsers/muse-glimmer.cpp",
-    "common/parsers/qwen3-coder.cpp",
+    "common/parsers/kimi-k3.cpp",          "common/parsers/ling3.cpp",
+    "common/parsers/lfm2.cpp",             "common/parsers/minicpm5.cpp",
+    "common/parsers/minimax-m3.cpp",       "common/parsers/ministral3.cpp",
+    "common/parsers/muse-glimmer.cpp",     "common/parsers/qwen3-coder.cpp",
 };
 
 /// mtmd's own sources. The per-architecture files under `models/` are globbed,
@@ -775,7 +775,7 @@ fn configureVulkan(b: *std.Build, platform: Platform) !?Vulkan {
 /// with the extension macros: run once with no source it writes
 /// `ggml-vulkan-shaders.hpp`, declaring every variant; run once per `.comp`
 /// with `--glslc` it compiles that file's variants and writes a `.cpp`
-/// holding their SPIR-V. Each run is a separate, cached step, so the 147
+/// holding their SPIR-V. Each run is a separate, cached step, so the 154
 /// shader files compile in parallel and only a changed one recompiles.
 ///
 /// Every `.comp` and `.glsl` is an input of every run: a shader's includes
@@ -821,6 +821,10 @@ fn addVulkan(b: *std.Build, cfg: Config, vk: Vulkan, mod: *std.Build.Module) !vo
     try vk_flags.appendSlice(b.allocator, cfg.cxx);
     try vk_flags.appendSlice(b.allocator, vk.features);
     for (vk.include_dirs) |dir| try vk_flags.appendSlice(b.allocator, &.{ "-idirafter", dir });
+    // `CXX_VISIBILITY_PRESET hidden` and `VISIBILITY_INLINES_HIDDEN ON`
+    // (ggml-vulkan/CMakeLists.txt:73-75, since v0.5.0), so a dlclosed duplicate
+    // copy cannot interpose the backend's symbols.
+    try vk_flags.appendSlice(b.allocator, &.{ "-fvisibility=hidden", "-fvisibility-inlines-hidden" });
 
     // Pass 2: one run per shader file, each writing that file's SPIR-V.
     for (comp.items) |file| {
@@ -841,7 +845,11 @@ fn addVulkan(b: *std.Build, cfg: Config, vk: Vulkan, mod: *std.Build.Module) !vo
 
     mod.addCSourceFiles(.{
         .root = b.path(src_root),
-        .files = &.{"ggml/src/ggml-vulkan/ggml-vulkan.cpp"},
+        .files = &.{
+            "ggml/src/ggml-vulkan/ggml-vulkan.cpp",
+            "ggml/src/ggml-vulkan/ggml-vulkan-buffers.cpp",
+            "ggml/src/ggml-vulkan/ggml-vulkan-debug.cpp",
+        },
         .flags = vk_flags.items,
     });
     // `libvulkan` is linked by the executable, in `addCli`, not here: Zig
