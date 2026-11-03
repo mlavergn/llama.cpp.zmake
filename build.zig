@@ -68,10 +68,10 @@ fn srcPath(b: *std.Build, sub: []const u8) std.Build.LazyPath {
 /// `git rev-parse --short HEAD` and `build_number` the build tag's number
 /// (`git describe --tags --match 'b*'`), as cmake/build-info.cmake derives
 /// them.
-const version = "0.5.0";
-const ggml_version = "0.25.1";
-const commit = "7fe450e19";
-const build_number = 11146;
+const version = "0.6.0";
+const ggml_version = "0.26.0";
+const commit = "d81235049";
+const build_number = 11429;
 
 /// The platforms this build knows how to configure.
 ///
@@ -216,7 +216,6 @@ const ggml_cxx_sources = [_][]const u8{
     "ggml/src/ggml-backend-reg.cpp",
     "ggml/src/ggml-cpu/ggml-cpu.cpp",
     "ggml/src/ggml-cpu/repack.cpp",
-    "ggml/src/ggml-cpu/iqp.cpp",
     "ggml/src/ggml-cpu/hbm.cpp",
     "ggml/src/ggml-cpu/traits.cpp",
     "ggml/src/ggml-cpu/binary-ops.cpp",
@@ -226,6 +225,8 @@ const ggml_cxx_sources = [_][]const u8{
     // amx compiles to nothing on ARM but CMake lists it unconditionally.
     "ggml/src/ggml-cpu/amx/amx.cpp",
     "ggml/src/ggml-cpu/amx/mmq.cpp",
+    "ggml/src/ggml-cpu/tiled/tiled.cpp",
+    "ggml/src/ggml-cpu/tiled/tiled-kernel.cpp",
     "ggml/src/ggml-cpu/llamafile/sgemm.cpp",
 };
 
@@ -276,10 +277,15 @@ const metal_objc_sources = [_][]const u8{
 /// `ggml-metal-device.m`. Each becomes a `ggml_metallib_<name>_{start,end}`
 /// symbol pair the Objective-C device layer reads at load time.
 const metal_kernels = [_][]const u8{
-    "fa",   "mul_mv",  "mul_mm",          "quantize",  "softmax",
-    "norm", "unary",   "binbcast",        "reduce",    "tri",
-    "ssm",  "wkv",     "gated_delta_net", "solve_tri", "rope",
-    "conv", "upscale", "argsort",         "pool",      "misc",
+    "fa_aux",      "fa_f16",      "fa_f32",      "fa_q4_0",
+    "fa_q4_1",     "fa_q5_0",     "fa_q5_1",     "fa_q8_0",
+    "fa_vec_f16",  "fa_vec_f32",  "fa_vec_q4_0", "fa_vec_q4_1",
+    "fa_vec_q5_0", "fa_vec_q5_1", "fa_vec_q8_0", "mul_mv",
+    "mul_mv_mma",  "mul_mm",      "quantize",    "softmax",
+    "norm",        "unary",       "binbcast",    "reduce",
+    "tri",         "ssm",         "wkv",         "gated_delta_net",
+    "solve_tri",   "rope",        "conv",        "upscale",
+    "argsort",     "pool",        "misc",
 };
 
 const llama_sources = [_][]const u8{
@@ -294,12 +300,11 @@ const llama_sources = [_][]const u8{
     "src/llama-kv-cache-msa.cpp",       "src/llama-kv-cache-dsv4.cpp",
     "src/llama-memory.cpp",             "src/llama-memory-hybrid.cpp",
     "src/llama-memory-hybrid-iswa.cpp", "src/llama-memory-hybrid-idx.cpp",
-    "src/llama-memory-recurrent.cpp",
-    "src/llama-mmap.cpp",               "src/llama-model-loader.cpp",
-    "src/llama-model-saver.cpp",        "src/llama-model.cpp",
-    "src/llama-quant.cpp",              "src/llama-sampler.cpp",
-    "src/llama-vocab.cpp",              "src/unicode-data.cpp",
-    "src/unicode.cpp",
+    "src/llama-memory-recurrent.cpp",   "src/llama-mmap.cpp",
+    "src/llama-model-loader.cpp",       "src/llama-model-saver.cpp",
+    "src/llama-model.cpp",              "src/llama-quant.cpp",
+    "src/llama-sampler.cpp",            "src/llama-vocab.cpp",
+    "src/unicode-data.cpp",             "src/unicode.cpp",
 };
 
 const common_sources = [_][]const u8{
@@ -311,23 +316,24 @@ const common_sources = [_][]const u8{
     "common/fit.cpp",                      "common/hf-cache.cpp",
     "common/imatrix-loader.cpp",           "common/json-schema-to-grammar.cpp",
     "common/json-schema.cpp",              "common/json.cpp",
-    "common/llguidance.cpp",
-    "common/log.cpp",                      "common/ngram-cache.cpp",
-    "common/ngram-map.cpp",                "common/ngram-mod.cpp",
-    "common/peg-parser.cpp",               "common/preset.cpp",
-    "common/reasoning-budget.cpp",         "common/sampling.cpp",
-    "common/speculative.cpp",              "common/subproc.cpp",
-    "common/trie.cpp",                     "common/unicode.cpp",
-    "common/jinja/lexer.cpp",              "common/jinja/parser.cpp",
-    "common/jinja/runtime.cpp",            "common/jinja/value.cpp",
-    "common/jinja/string.cpp",             "common/jinja/caps.cpp",
+    "common/llguidance.cpp",               "common/log.cpp",
+    "common/ngram-cache.cpp",              "common/ngram-map.cpp",
+    "common/ngram-mod.cpp",                "common/peg-parser.cpp",
+    "common/preset.cpp",                   "common/reasoning-budget.cpp",
+    "common/sampling.cpp",                 "common/speculative.cpp",
+    "common/subproc.cpp",                  "common/trie.cpp",
+    "common/unicode.cpp",                  "common/jinja/lexer.cpp",
+    "common/jinja/parser.cpp",             "common/jinja/runtime.cpp",
+    "common/jinja/value.cpp",              "common/jinja/string.cpp",
+    "common/jinja/caps.cpp",
     // common/parsers/sources.cmake's LLAMA_CHAT_PARSERS_SOURCES
-    "common/parsers/parsers.cpp",          "common/parsers/cohere2moe.cpp",
-    "common/parsers/deepseek.cpp",         "common/parsers/functionary-v3-2.cpp",
-    "common/parsers/gemma4.cpp",           "common/parsers/gigachat-v3.cpp",
-    "common/parsers/gpt-oss.cpp",          "common/parsers/kimi-k2.cpp",
-    "common/parsers/kimi-k3.cpp",          "common/parsers/ling3.cpp",
-    "common/parsers/lfm2.cpp",             "common/parsers/minicpm5.cpp",
+                  "common/parsers/parsers.cpp",
+    "common/parsers/cohere2moe.cpp",       "common/parsers/deepseek.cpp",
+    "common/parsers/functionary-v3-2.cpp", "common/parsers/gemma4.cpp",
+    "common/parsers/gigachat-v3.cpp",      "common/parsers/gpt-oss.cpp",
+    "common/parsers/kimi-k2.cpp",          "common/parsers/kimi-k3.cpp",
+    "common/parsers/ling3.cpp",            "common/parsers/lfm2.cpp",
+    "common/parsers/llm-jp-harmony.cpp",   "common/parsers/minicpm5.cpp",
     "common/parsers/minimax-m3.cpp",       "common/parsers/ministral3.cpp",
     "common/parsers/muse-glimmer.cpp",     "common/parsers/qwen3-coder.cpp",
 };
@@ -348,7 +354,7 @@ const server_context_sources = [_][]const u8{
     "tools/server/server-queue.cpp",   "tools/server/server-common.cpp",
     "tools/server/server-context.cpp", "tools/server/server-stream.cpp",
     "tools/server/server-tools.cpp",   "tools/server/server-mcp.cpp",
-    "tools/server/server-schema.cpp",
+    "tools/server/server-schema.cpp",  "tools/server/server-decision.cpp",
 };
 
 const server_impl_sources = [_][]const u8{
@@ -775,7 +781,7 @@ fn configureVulkan(b: *std.Build, platform: Platform) !?Vulkan {
 /// with the extension macros: run once with no source it writes
 /// `ggml-vulkan-shaders.hpp`, declaring every variant; run once per `.comp`
 /// with `--glslc` it compiles that file's variants and writes a `.cpp`
-/// holding their SPIR-V. Each run is a separate, cached step, so the 154
+/// holding their SPIR-V. Each run is a separate, cached step, so the 155
 /// shader files compile in parallel and only a changed one recompiles.
 ///
 /// Every `.comp` and `.glsl` is an input of every run: a shader's includes
@@ -888,6 +894,8 @@ fn embedMetalKernel(b: *std.Build, kind: []const u8) std.Build.LazyPath {
     run.addFileArg(srcPath(b, "ggml/src/ggml-metal/kernels/common.h"));
     run.addFileArg(srcPath(b, "ggml/src/ggml-metal/kernels/dequantize.h"));
     run.addFileArg(srcPath(b, "ggml/src/ggml-metal/kernels/quantize.h"));
+    run.addFileArg(srcPath(b, "ggml/src/ggml-metal/kernels/fa_common.metal"));
+    run.addFileArg(srcPath(b, "ggml/src/ggml-metal/kernels/fa_vec_common.metal"));
     run.addFileArg(srcPath(b, b.fmt("ggml/src/ggml-metal/kernels/{s}.metal", .{kind})));
 
     return out_asm;

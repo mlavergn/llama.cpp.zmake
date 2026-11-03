@@ -26,7 +26,7 @@ checkout replaced without reconciling anything.
 ## Use
 
 ```sh
-make clone     # fetch llama.cpp at v0.5.0
+make clone     # fetch llama.cpp at v0.6.0
 make           # build everything for the host
 make cli       # llama-cli, optimized, then chat with $(MODEL)
 make lib       # ggml and libllama only
@@ -75,7 +75,7 @@ needs: `glslc` (`-Dglslc`, else the one on `PATH`), the Vulkan and SPIR-V
 headers (`-Dvulkan-include`, default `/usr/include` on Linux), and `libvulkan`
 to link `llama-cli`. `build.zig` asks `glslc` which shader extensions it
 accepts, as `ggml-vulkan/CMakeLists.txt` does, and builds upstream's own
-`vulkan-shaders-gen` to compile the 154 shader files -- 1,119 variants with
+`vulkan-shaders-gen` to compile the 155 shader files -- 1,119 variants with
 no optional extension, 1,541 with all of them (counted at v0.5.0). Those answers and the header
 version decide which C++ compiles, so two builds compared on bits must use
 the same `glslc` and headers. Added for llamazig's Vulkan port under an
@@ -87,7 +87,7 @@ prompt, and seed at `--temp 0`.
 
 The iOS and Linux binaries are **not** runtime-verified. They compile and link
 with no undefined symbols, the Linux one registers the CPU backend and contains
-no Metal symbols, and the iOS one carries all twenty embedded shader libraries
+no Metal symbols, and the iOS one carries all thirty-five embedded shader libraries
 and targets platform 2 at minos 26.0 — but by this project's own standard that
 proves very little. Neither has been diffed against a CMake build on its own
 platform, and until one is, treat them as unproven.
