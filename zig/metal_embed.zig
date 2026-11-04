@@ -83,7 +83,7 @@ pub fn main(init: std.process.Init) !void {
         try joined.append(gpa, '\n');
     }
     // The flash-attention kernels share two bodies since v0.6.0, prepended in
-    // the order ggml-metal/CMakeLists.txt:106-113 tests for them.
+    // the order ggml-metal/CMakeLists.txt:107-114 tests for them.
     if (std.mem.find(u8, source, "#include \"fa_common.metal\"") != null) {
         try joined.appendSlice(gpa, fa_common);
         try joined.append(gpa, '\n');

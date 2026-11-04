@@ -68,10 +68,10 @@ fn srcPath(b: *std.Build, sub: []const u8) std.Build.LazyPath {
 /// `git rev-parse --short HEAD` and `build_number` the build tag's number
 /// (`git describe --tags --match 'b*'`), as cmake/build-info.cmake derives
 /// them.
-const version = "0.6.0";
-const ggml_version = "0.26.0";
-const commit = "d81235049";
-const build_number = 11429;
+const version = "0.7.0";
+const ggml_version = "0.27.0";
+const commit = "620d2225c";
+const build_number = 11669;
 
 /// The platforms this build knows how to configure.
 ///
@@ -277,34 +277,35 @@ const metal_objc_sources = [_][]const u8{
 /// `ggml-metal-device.m`. Each becomes a `ggml_metallib_<name>_{start,end}`
 /// symbol pair the Objective-C device layer reads at load time.
 const metal_kernels = [_][]const u8{
-    "fa_aux",      "fa_f16",      "fa_f32",      "fa_q4_0",
-    "fa_q4_1",     "fa_q5_0",     "fa_q5_1",     "fa_q8_0",
-    "fa_vec_f16",  "fa_vec_f32",  "fa_vec_q4_0", "fa_vec_q4_1",
-    "fa_vec_q5_0", "fa_vec_q5_1", "fa_vec_q8_0", "mul_mv",
-    "mul_mv_mma",  "mul_mm",      "quantize",    "softmax",
-    "norm",        "unary",       "binbcast",    "reduce",
-    "tri",         "ssm",         "wkv",         "gated_delta_net",
-    "solve_tri",   "rope",        "conv",        "upscale",
-    "argsort",     "pool",        "misc",
+    "fa_aux",          "fa_f16",      "fa_f32",      "fa_q4_0",
+    "fa_q4_1",         "fa_q5_0",     "fa_q5_1",     "fa_q8_0",
+    "fa_tensor",       "fa_vec_f16",  "fa_vec_f32",  "fa_vec_q4_0",
+    "fa_vec_q4_1",     "fa_vec_q5_0", "fa_vec_q5_1", "fa_vec_q8_0",
+    "mul_mv",          "mul_mv_mma",  "mul_mm",      "quantize",
+    "softmax",         "norm",        "unary",       "binbcast",
+    "reduce",          "tri",         "ssm",         "wkv",
+    "gated_delta_net", "solve_tri",   "rope",        "conv",
+    "upscale",         "argsort",     "pool",        "misc",
 };
 
 const llama_sources = [_][]const u8{
-    "src/llama.cpp",                    "src/llama-adapter.cpp",
-    "src/llama-arch.cpp",               "src/llama-batch.cpp",
-    "src/llama-chat.cpp",               "src/llama-context.cpp",
-    "src/llama-cparams.cpp",            "src/llama-grammar.cpp",
-    "src/llama-graph.cpp",              "src/llama-hparams.cpp",
-    "src/llama-impl.cpp",               "src/llama-io.cpp",
-    "src/llama-kv-cache.cpp",           "src/llama-kv-cache-iswa.cpp",
-    "src/llama-kv-cache-dsa.cpp",       "src/llama-kv-cache-dsa-iswa.cpp",
-    "src/llama-kv-cache-msa.cpp",       "src/llama-kv-cache-dsv4.cpp",
-    "src/llama-memory.cpp",             "src/llama-memory-hybrid.cpp",
-    "src/llama-memory-hybrid-iswa.cpp", "src/llama-memory-hybrid-idx.cpp",
-    "src/llama-memory-recurrent.cpp",   "src/llama-mmap.cpp",
-    "src/llama-model-loader.cpp",       "src/llama-model-saver.cpp",
-    "src/llama-model.cpp",              "src/llama-quant.cpp",
-    "src/llama-sampler.cpp",            "src/llama-vocab.cpp",
-    "src/unicode-data.cpp",             "src/unicode.cpp",
+    "src/llama.cpp",                   "src/llama-adapter.cpp",
+    "src/llama-arch.cpp",              "src/llama-batch.cpp",
+    "src/llama-chat.cpp",              "src/llama-context.cpp",
+    "src/llama-cparams.cpp",           "src/llama-grammar.cpp",
+    "src/llama-graph.cpp",             "src/llama-hparams.cpp",
+    "src/llama-impl.cpp",              "src/llama-io.cpp",
+    "src/llama-kv-cache.cpp",          "src/llama-kv-cache-iswa.cpp",
+    "src/llama-kv-cache-dsa.cpp",      "src/llama-kv-cache-dsa-iswa.cpp",
+    "src/llama-kv-cache-msa.cpp",      "src/llama-kv-cache-dsv4.cpp",
+    "src/llama-memory.cpp",            "src/llama-moe-cache.cpp",
+    "src/llama-memory-hybrid.cpp",     "src/llama-memory-hybrid-iswa.cpp",
+    "src/llama-memory-hybrid-idx.cpp", "src/llama-memory-recurrent.cpp",
+    "src/llama-mmap.cpp",              "src/llama-model-loader.cpp",
+    "src/llama-model-saver.cpp",       "src/llama-model.cpp",
+    "src/llama-quant.cpp",             "src/llama-sampler.cpp",
+    "src/llama-vocab.cpp",             "src/unicode-data.cpp",
+    "src/unicode.cpp",
 };
 
 const common_sources = [_][]const u8{
@@ -331,11 +332,12 @@ const common_sources = [_][]const u8{
     "common/parsers/cohere2moe.cpp",       "common/parsers/deepseek.cpp",
     "common/parsers/functionary-v3-2.cpp", "common/parsers/gemma4.cpp",
     "common/parsers/gigachat-v3.cpp",      "common/parsers/gpt-oss.cpp",
-    "common/parsers/kimi-k2.cpp",          "common/parsers/kimi-k3.cpp",
-    "common/parsers/ling3.cpp",            "common/parsers/lfm2.cpp",
-    "common/parsers/llm-jp-harmony.cpp",   "common/parsers/minicpm5.cpp",
-    "common/parsers/minimax-m3.cpp",       "common/parsers/ministral3.cpp",
-    "common/parsers/muse-glimmer.cpp",     "common/parsers/qwen3-coder.cpp",
+    "common/parsers/k2-horizon.cpp",       "common/parsers/kimi-k2.cpp",
+    "common/parsers/kimi-k3.cpp",          "common/parsers/ling3.cpp",
+    "common/parsers/lfm2.cpp",             "common/parsers/llm-jp-harmony.cpp",
+    "common/parsers/minicpm5.cpp",         "common/parsers/minimax-m3.cpp",
+    "common/parsers/ministral3.cpp",       "common/parsers/muse-glimmer.cpp",
+    "common/parsers/qwen3-coder.cpp",      "common/parsers/translate-gemma.cpp",
 };
 
 /// mtmd's own sources. The per-architecture files under `models/` are globbed,
@@ -910,7 +912,7 @@ fn addLlama(b: *std.Build, cfg: Config, ggml: *std.Build.Step.Compile) !*std.Bui
     addCommonIncludes(b, mod);
     // Private to this target; see addCommonIncludes.
     mod.addIncludePath(srcPath(b, "src"));
-    // src/CMakeLists.txt:55, configure_file(llama-version.h.in).
+    // src/CMakeLists.txt:66, configure_file(llama-version.h.in).
     mod.addConfigHeader(b.addConfigHeader(.{
         .style = .{ .cmake = srcPath(b, "src/llama-version.h.in") },
         .include_path = "llama-version.h",

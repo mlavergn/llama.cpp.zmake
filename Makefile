@@ -14,7 +14,7 @@
 .PHONY: clone build dist lib cli run clean distclean macos ios linux linux-x86_64 windows-x86_64 ui server web
 
 # Pinned deliberately. A port against a moving target does not converge.
-LLAMA_CPP_TAG ?= v0.6.0
+LLAMA_CPP_TAG ?= v0.7.0
 
 # The platform targets: arm64 everywhere, and x86_64 on Linux and Windows.
 # build.zig derives its whole configuration -- backends, source lists,
@@ -150,7 +150,7 @@ ui:
 	rsync -a --delete --exclude node_modules --exclude .svelte-kit --exclude dist llama.cpp/tools/ui/ $(UI_DIR)/src/
 	cd $(UI_DIR)/src && npm ci --no-audit --no-fund
 	rm -rf $(UI_DIR)/dist
-	cd $(UI_DIR)/src && LLAMA_UI_OUT_DIR=$(abspath $(UI_DIR))/dist LLAMA_UI_VERSION=$(UI_BUILD_NUM) \
+	cd $(UI_DIR)/src && LLAMA_UI_OUT_DIR="$(abspath $(UI_DIR))/dist" LLAMA_UI_VERSION=$(UI_BUILD_NUM) \
 		LLAMA_BUILD_NUMBER=$(UI_BUILD_NUM) npm run build
 	test -f $(UI_DIR)/dist/index.html
 
