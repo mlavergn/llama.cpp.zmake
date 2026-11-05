@@ -68,10 +68,10 @@ fn srcPath(b: *std.Build, sub: []const u8) std.Build.LazyPath {
 /// `git rev-parse --short HEAD` and `build_number` the build tag's number
 /// (`git describe --tags --match 'b*'`), as cmake/build-info.cmake derives
 /// them.
-const version = "0.7.0";
-const ggml_version = "0.27.0";
-const commit = "620d2225c";
-const build_number = 11669;
+const version = "0.8.0";
+const ggml_version = "0.28.0";
+const commit = "8642541b2";
+const build_number = 11960;
 
 /// The platforms this build knows how to configure.
 ///
@@ -314,30 +314,31 @@ const common_sources = [_][]const u8{
     "common/chat-peg-parser.cpp",          "common/chat.cpp",
     "common/common.cpp",                   "common/console.cpp",
     "common/debug.cpp",                    "common/download.cpp",
-    "common/fit.cpp",                      "common/hf-cache.cpp",
-    "common/imatrix-loader.cpp",           "common/json-schema-to-grammar.cpp",
-    "common/json-schema.cpp",              "common/json.cpp",
-    "common/llguidance.cpp",               "common/log.cpp",
-    "common/ngram-cache.cpp",              "common/ngram-map.cpp",
-    "common/ngram-mod.cpp",                "common/peg-parser.cpp",
-    "common/preset.cpp",                   "common/reasoning-budget.cpp",
-    "common/sampling.cpp",                 "common/speculative.cpp",
-    "common/subproc.cpp",                  "common/trie.cpp",
-    "common/unicode.cpp",                  "common/jinja/lexer.cpp",
-    "common/jinja/parser.cpp",             "common/jinja/runtime.cpp",
-    "common/jinja/value.cpp",              "common/jinja/string.cpp",
-    "common/jinja/caps.cpp",
+    "common/fit.cpp",                      "common/file-lock.cpp",
+    "common/hf-cache.cpp",                 "common/imatrix-loader.cpp",
+    "common/json-schema-to-grammar.cpp",   "common/json-schema.cpp",
+    "common/json.cpp",                     "common/llguidance.cpp",
+    "common/log.cpp",                      "common/ngram-cache.cpp",
+    "common/ngram-map.cpp",                "common/ngram-mod.cpp",
+    "common/peg-parser.cpp",               "common/preset.cpp",
+    "common/reasoning-budget.cpp",         "common/sampling.cpp",
+    "common/speculative.cpp",              "common/subproc.cpp",
+    "common/trie.cpp",                     "common/unicode.cpp",
+    "common/jinja/lexer.cpp",              "common/jinja/parser.cpp",
+    "common/jinja/runtime.cpp",            "common/jinja/value.cpp",
+    "common/jinja/string.cpp",             "common/jinja/caps.cpp",
     // common/parsers/sources.cmake's LLAMA_CHAT_PARSERS_SOURCES
-                  "common/parsers/parsers.cpp",
-    "common/parsers/cohere2moe.cpp",       "common/parsers/deepseek.cpp",
-    "common/parsers/functionary-v3-2.cpp", "common/parsers/gemma4.cpp",
-    "common/parsers/gigachat-v3.cpp",      "common/parsers/gpt-oss.cpp",
+    "common/parsers/parsers.cpp",          "common/parsers/cohere2moe.cpp",
+    "common/parsers/deepseek.cpp",         "common/parsers/functionary-v3-2.cpp",
+    "common/parsers/gemma4.cpp",           "common/parsers/gigachat-v3.cpp",
+    "common/parsers/gpt-oss.cpp",          "common/parsers/harmony-xml.cpp",
     "common/parsers/k2-horizon.cpp",       "common/parsers/kimi-k2.cpp",
     "common/parsers/kimi-k3.cpp",          "common/parsers/ling3.cpp",
     "common/parsers/lfm2.cpp",             "common/parsers/llm-jp-harmony.cpp",
     "common/parsers/minicpm5.cpp",         "common/parsers/minimax-m3.cpp",
     "common/parsers/ministral3.cpp",       "common/parsers/muse-glimmer.cpp",
-    "common/parsers/qwen3-coder.cpp",      "common/parsers/translate-gemma.cpp",
+    "common/parsers/muse-spark.cpp",       "common/parsers/qwen3-coder.cpp",
+    "common/parsers/translate-gemma.cpp",
 };
 
 /// mtmd's own sources. The per-architecture files under `models/` are globbed,
@@ -352,17 +353,20 @@ const mtmd_sources = [_][]const u8{
 };
 
 const server_context_sources = [_][]const u8{
-    "tools/server/server-chat.cpp",    "tools/server/server-task.cpp",
-    "tools/server/server-queue.cpp",   "tools/server/server-common.cpp",
-    "tools/server/server-context.cpp", "tools/server/server-stream.cpp",
-    "tools/server/server-tools.cpp",   "tools/server/server-mcp.cpp",
-    "tools/server/server-schema.cpp",  "tools/server/server-decision.cpp",
+    "tools/server/server-chat.cpp",     "tools/server/server-task.cpp",
+    "tools/server/server-queue.cpp",    "tools/server/server-common.cpp",
+    "tools/server/server-context.cpp",  "tools/server/server-realtime.cpp",
+    "tools/server/server-stream.cpp",   "tools/server/server-tools.cpp",
+    "tools/server/server-mcp.cpp",      "tools/server/server-schema.cpp",
+    "tools/server/server-decision.cpp",
 };
 
 const server_impl_sources = [_][]const u8{
     "tools/server/server.cpp",
+    "tools/server/server-connect.cpp",
     "tools/server/server-http.cpp",
     "tools/server/server-models.cpp",
+    "tools/server/server-models-sched.cpp",
 };
 
 const cli_impl_sources = [_][]const u8{
@@ -1049,7 +1053,7 @@ fn addCli(
         const mod = baseModule(b, cfg);
         mod.addIncludePath(ui_include);
         if (ui_headers) |h| {
-            // tools/ui/CMakeLists.txt:65, add_library(llama-ui ui.cpp) with cxx_std_17.
+            // tools/ui/CMakeLists.txt:63, add_library(llama-ui ui.cpp) with cxx_std_17.
             mod.addCSourceFile(.{ .file = h.cpp, .flags = cfg.cxx_std });
         } else {
             mod.addCSourceFiles(.{
@@ -1106,7 +1110,7 @@ fn addCli(
     mod.linkLibrary(cli_impl);
     linkVulkan(b, cfg, mod);
 
-    // tools/server/CMakeLists.txt:72, llama-server: main.cpp over llama-server-impl.
+    // tools/server/CMakeLists.txt:71, llama-server: main.cpp over llama-server-impl.
     const server = blk: {
         const smod = baseModule(b, cfg);
         addCommonIncludes(b, smod);

@@ -37,7 +37,7 @@ llama.cpp/                           sources (gitignored, `make clone`)
 ## Commands
 
 ```sh
-make clone     # fetch llama.cpp at $(LLAMA_CPP_TAG), currently v0.6.0
+make clone     # fetch llama.cpp at $(LLAMA_CPP_TAG), currently v0.8.0
 make           # everything for the host: ggml, libllama, llama-cli
 make cli       # llama-cli, optimized, then chat with $(MODEL)
 make lib       # ggml and libllama only
