@@ -14,15 +14,20 @@ description.
 The test of success is narrow and strict: a binary built here must produce
 **token-identical output** to the same sources built by CMake.
 
-## `llama.cpp/` is read-only
+## The sources are read-only
 
-The sources live in `llama.cpp/`, fetched by `make clone` at the pinned tag.
-That directory is **not part of this repository** — it is gitignored, and
-nothing here may modify it.
+The sources are the `llama_cpp` package in `build.zig.zon`: upstream's release
+tarball, pinned by URL and content hash. `zig build` fetches it on first use
+and unpacks it into `zig-pkg/<hash>/`. That directory is **not part of this
+repository** — it is gitignored, and nothing here may modify it. Upstream
+ships no `build.zig`, so the package contributes files only; `build.zig`
+reaches every one of them through `cfg.src`.
 
 This is the whole design. Because the build system sits outside the sources
-rather than being patched into them, the pinned tag can move or the checkout be
-replaced with nothing to reconcile. If something in llama.cpp seems to need
+rather than being patched into them, the pin can move with nothing to
+reconcile: `make pin LLAMA_CPP_TAG=<tag>` rewrites the URL and hash, and only
+`build.zig`'s `version`, `ggml_version`, `commit` and `build_number` still
+need updating by hand. If something in llama.cpp seems to need
 changing to make the build work, that is a signal the build description is
 wrong, not the source.
 
@@ -31,13 +36,15 @@ build.zig, build.zig.zon, Makefile   the build system
 zig/metal_embed.zig                  flattens a Metal kernel for embedding
 zig/ui-stub/                         stand-in for the web UI when none is embedded
 zig/ui_embed.zig                     embeds a built web UI (`-Dui`)
-llama.cpp/                           sources (gitignored, `make clone`)
+zig-pkg/<hash>/                      sources (gitignored, fetched by zig build)
 ```
 
 ## Commands
 
 ```sh
-make clone     # fetch llama.cpp at $(LLAMA_CPP_TAG), currently v0.9.0
+make fetch     # fetch the pinned sources ahead of time (any build does it too)
+make pin LLAMA_CPP_TAG=v0.10.0  # re-pin build.zig.zon to another release
+make srcdir    # print the pinned sources' directory
 make           # everything for the host: ggml, libllama, llama-cli
 make cli       # llama-cli, optimized, then chat with $(MODEL)
 make lib       # ggml and libllama only
@@ -47,7 +54,7 @@ make server    # llama-server, the UI embedded when .ui/dist exists
 make web       # both, then serve $(MODEL) on $(PORT) (default 8080)
 make run ARGS="-m model.gguf -ngl 99 -p 'hello' -st"
 make clean     # build output only
-make distclean # also removes the fetched sources
+make distclean # also removes zig-pkg; the tarball stays in Zig's global cache
 
 make macos     # llama-cli, arm64, optimized -> zig-out/macos/bin/
 make ios       #                             -> zig-out/ios/bin/
@@ -121,8 +128,10 @@ checked by diffing generated tokens against a CMake build of the same sources.
 ```sh
 # Reference build, Apple clang via CMake. Note -G "Unix Makefiles": the Xcode
 # generator drives xcodebuild, which ignores CMAKE_C_COMPILER.
+# The same bytes the Zig build compiles: zig-pkg/<hash>.
+SRC=$(make -s srcdir)
 mkdir -p /tmp/ref && cd /tmp/ref
-cmake $OLDPWD/llama.cpp -G "Unix Makefiles" \
+cmake "$SRC" -G "Unix Makefiles" \
   -DCMAKE_SYSTEM_NAME=Darwin -DCMAKE_OSX_SYSROOT=macosx \
   -DCMAKE_OSX_ARCHITECTURES=arm64 -DCMAKE_OSX_DEPLOYMENT_TARGET=13.0 \
   -DCMAKE_BUILD_TYPE=Release -DGGML_METAL=ON -DGGML_METAL_EMBED_LIBRARY=ON \
@@ -164,8 +173,8 @@ by the macOS diff alone; a change to `Platform`, the shared define lists, or
 - Zig **0.17.0** APIs. `std.Build.Module` options rather than the older compile
   step setters; `.language` on `addCSourceFiles` rather than `-x c++` flags,
   which Zig places after the file where they have no effect.
-- Source lists are kept **relative to the checkout** and each `addCSourceFiles`
-  call passes `.root = b.path(src_root)`. This keeps the lists byte-identical
+- Source lists are kept **relative to the sources** and each `addCSourceFiles`
+  call passes `.root = cfg.src.path("")`. This keeps the lists byte-identical
   to CMake's, so they can be diffed against it directly.
 - Where CMake globs a directory, `appendGlob` reads it too, rather than
   freezing a list that would go stale on the next sync.
@@ -280,9 +289,9 @@ download from a Hugging Face bucket under `LLAMA_USE_PREBUILT_UI` -- and
 
 Here the two halves are split:
 
-- **`make ui`** is the npm half. It copies `llama.cpp/tools/ui` to `.ui/src`
-  (npm writes `node_modules` and `.svelte-kit` beside its sources, and the
-  checkout is read-only), runs `npm ci` and `npm run build` with
+- **`make ui`** is the npm half. It copies `zig-pkg/<hash>/tools/ui` to
+  `.ui/src` (npm writes `node_modules` and `.svelte-kit` beside its sources,
+  and the sources are read-only), runs `npm ci` and `npm run build` with
   `LLAMA_UI_OUT_DIR` and the build number in the environment as CMake does,
   and leaves the bundle in `.ui/dist`. Needs node and npm; nothing else does.
 - **`zig build server -Dui=.ui/dist`** embeds it: `zig/ui_embed.zig` is

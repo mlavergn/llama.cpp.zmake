@@ -46,18 +46,15 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
-/// Where the llama.cpp checkout lives, relative to this build root.
+/// The name of the llama.cpp sources in `build.zig.zon`.
 ///
 /// The build system sits outside the sources rather than inside them: this
-/// directory is its own repository, and `make clone` fetches llama.cpp into a
-/// subdirectory. Nothing in the checkout is modified, so it can be replaced or
-/// re-pinned without touching anything here.
-const src_root = "llama.cpp";
-
-/// A path inside the llama.cpp checkout.
-fn srcPath(b: *std.Build, sub: []const u8) std.Build.LazyPath {
-    return b.path(b.fmt("{s}/{s}", .{ src_root, sub }));
-}
+/// directory is its own repository, and the sources are a package Zig fetches
+/// from upstream's release tarball, pinned by content hash. Upstream ships no
+/// `build.zig`, so the package contributes files only; every path into it goes
+/// through `Config.src`. Nothing in it is modified, so re-pinning is a new URL
+/// and hash in `build.zig.zon` with nothing here to reconcile.
+const src_dep = "llama_cpp";
 
 /// What CMake configures `ggml-version.h`, `llama-version.h` and
 /// `build-info.cpp` with at the pinned release tag.
@@ -384,6 +381,11 @@ const Config = struct {
     optimize: std.lang.Optimize,
     platform: Platform,
 
+    /// The llama.cpp sources (`src_dep`). `path` gives the lazy paths the
+    /// graph compiles; `builder.root` is the same directory, for the globs
+    /// that list it at configure time.
+    src: *std.Build.Dependency,
+
     /// Apple SDK path. Null on Linux and Windows.
     sdk: ?[]const u8,
 
@@ -459,8 +461,9 @@ pub fn build(b: *std.Build) !void {
         return error.UnsupportedTarget;
     }
 
+    const src = b.dependency(src_dep, .{});
     const sdk = if (platform.isApple()) try resolveAppleSdk(b, target.result) else null;
-    const vulkan = try configureVulkan(b, platform);
+    const vulkan = try configureVulkan(b, platform, src);
 
     var defs: std.ArrayList([]const u8) = .empty;
     try defs.appendSlice(b.allocator, &base_defines);
@@ -478,6 +481,7 @@ pub fn build(b: *std.Build) !void {
         .target = target,
         .optimize = optimize,
         .platform = platform,
+        .src = src,
         .sdk = sdk,
         .libc_file = if (sdk) |s| writeAppleLibcFile(b, s) else null,
         .c_std = lang_c,
@@ -608,17 +612,17 @@ fn addExecutable(b: *std.Build, cfg: Config, name: []const u8, mod: *std.Build.M
 }
 
 /// Adds the include paths shared by everything above ggml.
-fn addCommonIncludes(b: *std.Build, mod: *std.Build.Module) void {
-    mod.addIncludePath(b.path(src_root));
-    mod.addIncludePath(srcPath(b, "include"));
+fn addCommonIncludes(cfg: Config, mod: *std.Build.Module) void {
+    mod.addIncludePath(cfg.src.path(""));
+    mod.addIncludePath(cfg.src.path("include"));
     // Note `src` is deliberately absent. It holds a second unicode.h, and
     // adding it here shadows common/unicode.h, which common/jinja needs.
     // CMake keeps it PRIVATE to the llama target for the same reason.
-    mod.addIncludePath(srcPath(b, "common"));
-    mod.addIncludePath(srcPath(b, "ggml/include"));
-    mod.addIncludePath(srcPath(b, "ggml/src"));
+    mod.addIncludePath(cfg.src.path("common"));
+    mod.addIncludePath(cfg.src.path("ggml/include"));
+    mod.addIncludePath(cfg.src.path("ggml/src"));
     // Covers both <nlohmann/json.hpp> and <cpp-httplib/httplib.h>.
-    mod.addIncludePath(srcPath(b, "vendor"));
+    mod.addIncludePath(cfg.src.path("vendor"));
 }
 
 /// The shader extensions `ggml/src/ggml-vulkan/CMakeLists.txt:80-121` asks
@@ -644,7 +648,7 @@ const vulkan_features = [_]VulkanFeature{
     .{ .extension = "GL_EXT_float_e4m3", .test_shader = "float_e4m3.comp", .define = "GGML_VULKAN_FLOAT_E4M3_GLSLC_SUPPORT" },
 };
 
-/// The Vulkan shader sources and their generator, relative to the checkout.
+/// The Vulkan shader sources and their generator, relative to the sources.
 const vulkan_shaders_dir = "ggml/src/ggml-vulkan/vulkan-shaders";
 
 /// What `-Dvulkan` resolved to at configure time.
@@ -669,27 +673,27 @@ const Vulkan = struct {
 fn addGgml(b: *std.Build, cfg: Config) !*std.Build.Step.Compile {
     const mod = baseModule(b, cfg);
 
-    mod.addIncludePath(srcPath(b, "ggml/include"));
-    mod.addIncludePath(srcPath(b, "ggml/src"));
-    mod.addIncludePath(srcPath(b, "ggml/src/ggml-cpu"));
+    mod.addIncludePath(cfg.src.path("ggml/include"));
+    mod.addIncludePath(cfg.src.path("ggml/src"));
+    mod.addIncludePath(cfg.src.path("ggml/src/ggml-cpu"));
     // ggml/src/CMakeLists.txt:216, configure_file(ggml-version.h.in).
     mod.addConfigHeader(b.addConfigHeader(.{
-        .style = .{ .cmake = srcPath(b, "ggml/src/ggml-version.h.in") },
+        .style = .{ .cmake = cfg.src.path("ggml/src/ggml-version.h.in") },
         .include_path = "ggml-version.h",
     }, .{ .GGML_VERSION = ggml_version, .GGML_BUILD_COMMIT = commit }));
 
-    mod.addCSourceFiles(.{ .root = b.path(src_root), .files = &ggml_c_sources, .flags = cfg.c });
-    mod.addCSourceFiles(.{ .root = b.path(src_root), .files = &ggml_cxx_sources, .flags = cfg.cxx });
+    mod.addCSourceFiles(.{ .root = cfg.src.path(""), .files = &ggml_c_sources, .flags = cfg.c });
+    mod.addCSourceFiles(.{ .root = cfg.src.path(""), .files = &ggml_cxx_sources, .flags = cfg.cxx });
     const arch = archSources(cfg.target.result.cpu.arch).?;
-    mod.addCSourceFiles(.{ .root = b.path(src_root), .files = arch.c, .flags = cfg.c });
-    mod.addCSourceFiles(.{ .root = b.path(src_root), .files = arch.cxx, .flags = cfg.cxx });
+    mod.addCSourceFiles(.{ .root = cfg.src.path(""), .files = arch.c, .flags = cfg.c });
+    mod.addCSourceFiles(.{ .root = cfg.src.path(""), .files = arch.cxx, .flags = cfg.cxx });
 
     if (cfg.platform.isApple()) {
-        mod.addIncludePath(srcPath(b, "ggml/src/ggml-metal"));
-        mod.addCSourceFiles(.{ .root = b.path(src_root), .files = &metal_cxx_sources, .flags = cfg.cxx });
-        mod.addCSourceFiles(.{ .root = b.path(src_root), .files = &metal_objc_sources, .flags = cfg.objc });
+        mod.addIncludePath(cfg.src.path("ggml/src/ggml-metal"));
+        mod.addCSourceFiles(.{ .root = cfg.src.path(""), .files = &metal_cxx_sources, .flags = cfg.cxx });
+        mod.addCSourceFiles(.{ .root = cfg.src.path(""), .files = &metal_objc_sources, .flags = cfg.objc });
 
-        for (metal_kernels) |kind| mod.addAssemblyFile(embedMetalKernel(b, kind));
+        for (metal_kernels) |kind| mod.addAssemblyFile(embedMetalKernel(b, cfg, kind));
 
         mod.linkFramework("Foundation", .{});
         mod.linkFramework("Metal", .{});
@@ -714,10 +718,11 @@ fn addGgml(b: *std.Build, cfg: Config) !*std.Build.Step.Compile {
 /// Parameters:
 /// - `b`: the build graph, for its options, allocator and process spawning.
 /// - `platform`: decides the default header directory.
+/// - `src`: the llama.cpp sources, for the feature-test shaders.
 ///
 /// Return: null without `-Dvulkan`; otherwise the configuration, or an error
 /// when `glslc` or the headers cannot be found or a probe cannot run.
-fn configureVulkan(b: *std.Build, platform: Platform) !?Vulkan {
+fn configureVulkan(b: *std.Build, platform: Platform, src: *std.Build.Dependency) !?Vulkan {
     const enabled = b.option(bool, "vulkan", "Build ggml's Vulkan backend (needs glslc, the Vulkan and SPIR-V headers, and libvulkan)") orelse false;
     const glslc_opt = b.option([]const u8, "glslc", "The glslc to compile the Vulkan shaders with (default: glslc on PATH)");
     const include_opt = b.option([]const []const u8, "vulkan-include", "Directories holding vulkan/ and spirv/, searched after libc's headers (default on Linux: /usr/include)");
@@ -748,9 +753,9 @@ fn configureVulkan(b: *std.Build, platform: Platform) !?Vulkan {
 
     var features: std.ArrayList([]const u8) = .empty;
     for (vulkan_features) |f| {
-        const rel = b.fmt("{s}/{s}/feature-tests/{s}", .{ src_root, vulkan_shaders_dir, f.test_shader });
-        b.dependOnFileContents(b.path(rel));
-        const test_shader = try b.root.joinString(b.allocator, rel);
+        const rel = b.fmt("{s}/feature-tests/{s}", .{ vulkan_shaders_dir, f.test_shader });
+        b.dependOnFileContents(src.path(rel));
+        const test_shader = try src.builder.root.joinString(b.allocator, rel);
         // glslc's diagnostics go to stderr and it exits non-zero on the
         // refusal, so the shell folds both into a successful stdout.
         const out = switch (b.runFallible(&.{
@@ -809,15 +814,15 @@ fn addVulkan(b: *std.Build, cfg: Config, vk: Vulkan, mod: *std.Build.Module) !vo
         .sanitize_c = .off,
     });
     gen_mod.addCSourceFile(.{
-        .file = srcPath(b, vulkan_shaders_dir ++ "/vulkan-shaders-gen.cpp"),
+        .file = cfg.src.path(vulkan_shaders_dir ++ "/vulkan-shaders-gen.cpp"),
         .flags = try join(b, &cxx_std, vk.features),
     });
     const gen = b.addExecutable(.{ .name = "vulkan-shaders-gen", .root_module = gen_mod });
 
     var comp: std.ArrayList([]const u8) = .empty;
-    try appendGlob(b, &comp, vulkan_shaders_dir, ".comp");
+    try appendGlob(b, cfg, &comp, vulkan_shaders_dir, ".comp");
     var glsl: std.ArrayList([]const u8) = .empty;
-    try appendGlob(b, &glsl, vulkan_shaders_dir, ".glsl");
+    try appendGlob(b, cfg, &glsl, vulkan_shaders_dir, ".glsl");
 
     // Pass 1: the header, which names every variant.
     const hdr_run = b.addRunArtifact(gen);
@@ -843,20 +848,20 @@ fn addVulkan(b: *std.Build, cfg: Config, vk: Vulkan, mod: *std.Build.Module) !vo
         const run = b.addRunArtifact(gen);
         run.addArgs(&.{ "--glslc", vk.glslc });
         run.addArg("--source");
-        run.addFileArg(srcPath(b, file));
+        run.addFileArg(cfg.src.path(file));
         run.addArg("--output-dir");
         _ = run.addOutputDirectoryArg("spv");
         // Only its basename is used, for the generated `#include`.
         run.addArgs(&.{ "--target-hpp", "ggml-vulkan-shaders.hpp" });
         run.addArg("--target-cpp");
         const cpp = run.addOutputFileArg(b.fmt("{s}.cpp", .{std.fs.path.basename(file)}));
-        for (comp.items) |f| run.addFileInput(srcPath(b, f));
-        for (glsl.items) |f| run.addFileInput(srcPath(b, f));
+        for (comp.items) |f| run.addFileInput(cfg.src.path(f));
+        for (glsl.items) |f| run.addFileInput(cfg.src.path(f));
         mod.addCSourceFile(.{ .file = cpp, .flags = cfg.cxx });
     }
 
     mod.addCSourceFiles(.{
-        .root = b.path(src_root),
+        .root = cfg.src.path(""),
         .files = &.{
             "ggml/src/ggml-vulkan/ggml-vulkan.cpp",
             "ggml/src/ggml-vulkan/ggml-vulkan-buffers.cpp",
@@ -881,7 +886,7 @@ fn addVulkan(b: *std.Build, cfg: Config, vk: Vulkan, mod: *std.Build.Module) !vo
 ///
 /// Never switch to the non-embedded path: that one does need `xcrun metal`,
 /// which the Zig toolchain cannot replace.
-fn embedMetalKernel(b: *std.Build, kind: []const u8) std.Build.LazyPath {
+fn embedMetalKernel(b: *std.Build, cfg: Config, kind: []const u8) std.Build.LazyPath {
     const tool = b.addExecutable(.{
         .name = "metal_embed",
         .root_module = b.createModule(.{
@@ -896,14 +901,14 @@ fn embedMetalKernel(b: *std.Build, kind: []const u8) std.Build.LazyPath {
     _ = run.addOutputFileArg(b.fmt("ggml-metal-embed-{s}.metal", .{kind}));
     const out_asm = run.addOutputFileArg(b.fmt("ggml-metal-embed-{s}.s", .{kind}));
 
-    run.addFileArg(srcPath(b, "ggml/src/ggml-common.h"));
-    run.addFileArg(srcPath(b, "ggml/src/ggml-metal/ggml-metal-impl.h"));
-    run.addFileArg(srcPath(b, "ggml/src/ggml-metal/kernels/common.h"));
-    run.addFileArg(srcPath(b, "ggml/src/ggml-metal/kernels/dequantize.h"));
-    run.addFileArg(srcPath(b, "ggml/src/ggml-metal/kernels/quantize.h"));
-    run.addFileArg(srcPath(b, "ggml/src/ggml-metal/kernels/fa_common.metal"));
-    run.addFileArg(srcPath(b, "ggml/src/ggml-metal/kernels/fa_vec_common.metal"));
-    run.addFileArg(srcPath(b, b.fmt("ggml/src/ggml-metal/kernels/{s}.metal", .{kind})));
+    run.addFileArg(cfg.src.path("ggml/src/ggml-common.h"));
+    run.addFileArg(cfg.src.path("ggml/src/ggml-metal/ggml-metal-impl.h"));
+    run.addFileArg(cfg.src.path("ggml/src/ggml-metal/kernels/common.h"));
+    run.addFileArg(cfg.src.path("ggml/src/ggml-metal/kernels/dequantize.h"));
+    run.addFileArg(cfg.src.path("ggml/src/ggml-metal/kernels/quantize.h"));
+    run.addFileArg(cfg.src.path("ggml/src/ggml-metal/kernels/fa_common.metal"));
+    run.addFileArg(cfg.src.path("ggml/src/ggml-metal/kernels/fa_vec_common.metal"));
+    run.addFileArg(cfg.src.path(b.fmt("ggml/src/ggml-metal/kernels/{s}.metal", .{kind})));
 
     return out_asm;
 }
@@ -914,21 +919,21 @@ fn embedMetalKernel(b: *std.Build, kind: []const u8) std.Build.LazyPath {
 /// CMake's `file(GLOB)` does, so adding one needs no build change.
 fn addLlama(b: *std.Build, cfg: Config, ggml: *std.Build.Step.Compile) !*std.Build.Step.Compile {
     const mod = baseModule(b, cfg);
-    addCommonIncludes(b, mod);
+    addCommonIncludes(cfg, mod);
     // Private to this target; see addCommonIncludes.
-    mod.addIncludePath(srcPath(b, "src"));
+    mod.addIncludePath(cfg.src.path("src"));
     // src/CMakeLists.txt:66, configure_file(llama-version.h.in).
     mod.addConfigHeader(b.addConfigHeader(.{
-        .style = .{ .cmake = srcPath(b, "src/llama-version.h.in") },
+        .style = .{ .cmake = cfg.src.path("src/llama-version.h.in") },
         .include_path = "llama-version.h",
     }, .{ .LLAMA_VERSION = version, .LLAMA_BUILD_COMMIT = commit }));
 
     var files: std.ArrayList([]const u8) = .empty;
     try files.appendSlice(b.allocator, &llama_sources);
-    try appendGlob(b, &files, "src/models", ".cpp");
+    try appendGlob(b, cfg, &files, "src/models", ".cpp");
 
     mod.addCSourceFiles(.{
-        .root = b.path(src_root),
+        .root = cfg.src.path(""),
         .files = files.items,
         .flags = cfg.cxx,
     });
@@ -952,10 +957,10 @@ fn addCli(
     // vendor::hash, needed by mtmd.
     const hash = blk: {
         const mod = baseModule(b, cfg);
-        mod.addIncludePath(srcPath(b, "vendor"));
-        mod.addIncludePath(srcPath(b, "vendor/hash"));
+        mod.addIncludePath(cfg.src.path("vendor"));
+        mod.addIncludePath(cfg.src.path("vendor/hash"));
         mod.addCSourceFiles(.{
-            .root = b.path(src_root),
+            .root = cfg.src.path(""),
             .files = &[_][]const u8{"vendor/hash/hash.cpp"},
             .flags = cfg.cxx_std,
         });
@@ -963,13 +968,13 @@ fn addCli(
         // (vendor/hash/CMakeLists.txt:32) because the file wraps itself in a
         // namespace to avoid clashing with boringssl's symbols.
         mod.addCSourceFiles(.{
-            .root = b.path(src_root),
+            .root = cfg.src.path(""),
             .files = &[_][]const u8{"vendor/hash/sha1/sha1.c"},
             .flags = cfg.cxx_std,
             .language = .cpp,
         });
         mod.addCSourceFiles(.{
-            .root = b.path(src_root),
+            .root = cfg.src.path(""),
             .files = &[_][]const u8{
                 "vendor/hash/xxhash/xxhash.c",
                 "vendor/hash/sha256/sha256.c",
@@ -982,10 +987,10 @@ fn addCli(
     // cpp-httplib, needed by the server and by common's downloader.
     const httplib = blk: {
         const mod = baseModule(b, cfg);
-        mod.addIncludePath(srcPath(b, "vendor"));
-        mod.addIncludePath(srcPath(b, "vendor/cpp-httplib"));
+        mod.addIncludePath(cfg.src.path("vendor"));
+        mod.addIncludePath(cfg.src.path("vendor/cpp-httplib"));
         mod.addCSourceFiles(.{
-            .root = b.path(src_root),
+            .root = cfg.src.path(""),
             .files = &[_][]const u8{"vendor/cpp-httplib/httplib.cpp"},
             .flags = try join(b, cfg.cxx_std, &httplib_defines),
         });
@@ -998,7 +1003,7 @@ fn addCli(
     // build-info.cpp.in as common/CMakeLists.txt does. The resolved target is
     // only known at configure time, so the triple is formatted.
     const build_info = b.addConfigHeader(.{
-        .style = .{ .cmake = srcPath(b, "common/build-info.cpp.in") },
+        .style = .{ .cmake = cfg.src.path("common/build-info.cpp.in") },
         .include_path = "build-info.cpp",
     }, .{
         .LLAMA_BUILD_NUMBER = build_number,
@@ -1012,7 +1017,7 @@ fn addCli(
 
     const common_base = blk: {
         const mod = baseModule(b, cfg);
-        addCommonIncludes(b, mod);
+        addCommonIncludes(cfg, mod);
         mod.addCSourceFile(.{ .file = build_info, .flags = cfg.cxx });
         break :blk addLibrary(b, cfg, "llama-common-base", mod);
     };
@@ -1020,15 +1025,15 @@ fn addCli(
     // mtmd: multimodal support. The CLI links it through server-context.
     const mtmd = blk: {
         const mod = baseModule(b, cfg);
-        addCommonIncludes(b, mod);
-        mod.addIncludePath(srcPath(b, "tools/mtmd"));
-        mod.addIncludePath(srcPath(b, "vendor/hash"));
+        addCommonIncludes(cfg, mod);
+        mod.addIncludePath(cfg.src.path("tools/mtmd"));
+        mod.addIncludePath(cfg.src.path("vendor/hash"));
 
         var files: std.ArrayList([]const u8) = .empty;
         try files.appendSlice(b.allocator, &mtmd_sources);
-        try appendGlob(b, &files, "tools/mtmd/models", ".cpp");
+        try appendGlob(b, cfg, &files, "tools/mtmd/models", ".cpp");
 
-        mod.addCSourceFiles(.{ .root = b.path(src_root), .files = files.items, .flags = cfg.cxx });
+        mod.addCSourceFiles(.{ .root = cfg.src.path(""), .files = files.items, .flags = cfg.cxx });
         mod.linkLibrary(llama);
         mod.linkLibrary(ggml);
         mod.linkLibrary(hash);
@@ -1037,9 +1042,9 @@ fn addCli(
 
     const common = blk: {
         const mod = baseModule(b, cfg);
-        addCommonIncludes(b, mod);
-        mod.addIncludePath(srcPath(b, "tools/mtmd"));
-        mod.addCSourceFiles(.{ .root = b.path(src_root), .files = &common_sources, .flags = cfg.cxx });
+        addCommonIncludes(cfg, mod);
+        mod.addIncludePath(cfg.src.path("tools/mtmd"));
+        mod.addCSourceFiles(.{ .root = cfg.src.path(""), .files = &common_sources, .flags = cfg.cxx });
         mod.linkLibrary(common_base);
         mod.linkLibrary(httplib);
         mod.linkLibrary(llama);
@@ -1067,10 +1072,10 @@ fn addCli(
 
     const server_context = blk: {
         const mod = baseModule(b, cfg);
-        addCommonIncludes(b, mod);
-        mod.addIncludePath(srcPath(b, "tools/mtmd"));
-        mod.addIncludePath(srcPath(b, "tools/server"));
-        mod.addCSourceFiles(.{ .root = b.path(src_root), .files = &server_context_sources, .flags = cfg.cxx });
+        addCommonIncludes(cfg, mod);
+        mod.addIncludePath(cfg.src.path("tools/mtmd"));
+        mod.addIncludePath(cfg.src.path("tools/server"));
+        mod.addCSourceFiles(.{ .root = cfg.src.path(""), .files = &server_context_sources, .flags = cfg.cxx });
         mod.linkLibrary(common);
         mod.linkLibrary(mtmd);
         break :blk addLibrary(b, cfg, "server-context", mod);
@@ -1078,11 +1083,11 @@ fn addCli(
 
     const server_impl = blk: {
         const mod = baseModule(b, cfg);
-        addCommonIncludes(b, mod);
-        mod.addIncludePath(srcPath(b, "tools/mtmd"));
-        mod.addIncludePath(srcPath(b, "tools/server"));
+        addCommonIncludes(cfg, mod);
+        mod.addIncludePath(cfg.src.path("tools/mtmd"));
+        mod.addIncludePath(cfg.src.path("tools/server"));
         mod.addIncludePath(ui_include);
-        mod.addCSourceFiles(.{ .root = b.path(src_root), .files = &server_impl_sources, .flags = cfg.cxx });
+        mod.addCSourceFiles(.{ .root = cfg.src.path(""), .files = &server_impl_sources, .flags = cfg.cxx });
         mod.linkLibrary(server_context);
         mod.linkLibrary(ui);
         mod.linkLibrary(httplib);
@@ -1091,20 +1096,20 @@ fn addCli(
 
     const cli_impl = blk: {
         const mod = baseModule(b, cfg);
-        addCommonIncludes(b, mod);
-        mod.addIncludePath(srcPath(b, "tools/cli"));
-        mod.addIncludePath(srcPath(b, "tools/server"));
-        mod.addIncludePath(srcPath(b, "tools/mtmd"));
-        mod.addCSourceFiles(.{ .root = b.path(src_root), .files = &cli_impl_sources, .flags = cfg.cxx });
+        addCommonIncludes(cfg, mod);
+        mod.addIncludePath(cfg.src.path("tools/cli"));
+        mod.addIncludePath(cfg.src.path("tools/server"));
+        mod.addIncludePath(cfg.src.path("tools/mtmd"));
+        mod.addCSourceFiles(.{ .root = cfg.src.path(""), .files = &cli_impl_sources, .flags = cfg.cxx });
         mod.linkLibrary(server_impl);
         break :blk addLibrary(b, cfg, "llama-cli-impl", mod);
     };
 
     const mod = baseModule(b, cfg);
-    addCommonIncludes(b, mod);
-    mod.addIncludePath(srcPath(b, "tools/cli"));
+    addCommonIncludes(cfg, mod);
+    mod.addIncludePath(cfg.src.path("tools/cli"));
     mod.addCSourceFiles(.{
-        .root = b.path(src_root),
+        .root = cfg.src.path(""),
         .files = &[_][]const u8{"tools/cli/main.cpp"},
         .flags = cfg.cxx,
     });
@@ -1114,10 +1119,10 @@ fn addCli(
     // tools/server/CMakeLists.txt:71, llama-server: main.cpp over llama-server-impl.
     const server = blk: {
         const smod = baseModule(b, cfg);
-        addCommonIncludes(b, smod);
-        smod.addIncludePath(srcPath(b, "tools/server"));
+        addCommonIncludes(cfg, smod);
+        smod.addIncludePath(cfg.src.path("tools/server"));
         smod.addCSourceFiles(.{
-            .root = b.path(src_root),
+            .root = cfg.src.path(""),
             .files = &[_][]const u8{"tools/server/main.cpp"},
             .flags = cfg.cxx,
         });
@@ -1182,8 +1187,8 @@ fn embedUi(b: *std.Build, cfg: Config, dist_path: []const u8) !UiHeaders {
     });
     const run = b.addRunArtifact(tool);
     run.addDirectoryArg(dist);
-    run.addFileArg(srcPath(b, "tools/ui/ui.h.in"));
-    run.addFileArg(srcPath(b, "tools/ui/ui.cpp.in"));
+    run.addFileArg(cfg.src.path("tools/ui/ui.h.in"));
+    run.addFileArg(cfg.src.path("tools/ui/ui.cpp.in"));
     run.addArg(if (cfg.ui_gzip) "1" else "0");
     const h = run.addOutputFileArg("ui.h");
     const cpp = run.addOutputFileArg("ui.cpp");
@@ -1216,20 +1221,22 @@ fn embedUi(b: *std.Build, cfg: Config, dist_path: []const u8) !UiHeaders {
 ///
 /// Parameters:
 /// - `b`: the build graph, for its allocator and IO.
-/// - `files`: list to append repo-relative paths to.
-/// - `dir`: directory to read, relative to the build root.
+/// - `cfg`: for the sources' directory.
+/// - `files`: list to append source-relative paths to.
+/// - `dir`: directory to read, relative to the sources.
 /// - `ext`: extension to match, including the dot.
 ///
 /// Return: nothing; propagates directory-read and allocation failures.
-fn appendGlob(b: *std.Build, files: *std.ArrayList([]const u8), dir: []const u8, ext: []const u8) !void {
-    // `dir` is relative to the checkout, and so are the paths appended, since
-    // the source lists are resolved against `src_root`.
-    const full = b.fmt("{s}/{s}", .{ src_root, dir });
+fn appendGlob(b: *std.Build, cfg: Config, files: *std.ArrayList([]const u8), dir: []const u8, ext: []const u8) !void {
+    // `dir` is relative to the sources, and so are the paths appended, since
+    // the source lists are resolved against `cfg.src`.
+    //
     // Zig 0.17 reuses a configured build graph until one of its declared
-    // inputs changes, and a directory listing is not one by default. A file
-    // added to or removed from the checkout must reconfigure.
-    b.dependOnDirectoryContents(b.path(full));
-    var handle = try b.root.openDir(b.graph.io, full, .{ .iterate = true });
+    // inputs changes, and a directory listing is not one by default. A pinned
+    // package cannot change without its hash, but its unpacked copy under
+    // `zig-pkg/` is an ordinary directory, and an edit to it must reconfigure.
+    b.dependOnDirectoryContents(cfg.src.path(dir));
+    var handle = try cfg.src.builder.root.openDir(b.graph.io, dir, .{ .iterate = true });
     defer handle.close(b.graph.io);
 
     var it = handle.iterate();

@@ -4,8 +4,9 @@ A Zig build system for [llama.cpp](https://github.com/ggerganov/llama.cpp),
 replacing CMake.
 
 The sources stay C, C++, and Objective-C. Nothing here ports code, and nothing
-here modifies llama.cpp — this directory sits outside the checkout and reads it
-from `./llama.cpp`.
+here modifies llama.cpp — this directory sits outside the sources, which Zig's
+package manager fetches from upstream's release tarball, pinned by hash in
+`build.zig.zon`.
 
 ## Layout
 
@@ -17,16 +18,17 @@ llama.cpp.zmake/          this repository
 ├── zig/
 │   ├── metal_embed.zig   flattens a Metal kernel for embedding
 │   └── ui-stub/          stand-in for the generated web UI assets
-└── llama.cpp/            the sources, fetched by `make clone` (gitignored)
+└── zig-pkg/<hash>/       the sources, fetched by zig build (gitignored)
 ```
 
-Because the sources are untouched, the pinned tag can be changed or the
-checkout replaced without reconciling anything.
+Because the sources are untouched, the pin can be moved without reconciling
+anything: `make pin LLAMA_CPP_TAG=<tag>` rewrites the URL and hash in
+`build.zig.zon`.
 
 ## Use
 
 ```sh
-make clone     # fetch llama.cpp at v0.9.0
+make fetch     # fetch llama.cpp v0.9.0 ahead of time (any build does it too)
 make           # build everything for the host
 make cli       # llama-cli, optimized, then chat with $(MODEL)
 make lib       # ggml and libllama only
@@ -107,9 +109,9 @@ download from a Hugging Face bucket under `LLAMA_USE_PREBUILT_UI` -- and
 
 Here the two halves are split:
 
-- **`make ui`** is the npm half. It copies `llama.cpp/tools/ui` to `.ui/src`
-  (npm writes `node_modules` and `.svelte-kit` beside its sources, and the
-  checkout is read-only), runs `npm ci` and `npm run build` with
+- **`make ui`** is the npm half. It copies `zig-pkg/<hash>/tools/ui` to
+  `.ui/src` (npm writes `node_modules` and `.svelte-kit` beside its sources,
+  and the sources are read-only), runs `npm ci` and `npm run build` with
   `LLAMA_UI_OUT_DIR` and the build number in the environment as CMake does,
   and leaves the bundle in `.ui/dist`. Needs node and npm; nothing else does.
 - **`zig build server -Dui=.ui/dist`** embeds it: `zig/ui_embed.zig` is

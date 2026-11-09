@@ -2,9 +2,9 @@
 zig-out
 .zig-cache
 
-# The llama.cpp sources, fetched by `make clone`. Not vendored here: this
-# repository is the build system, not a fork.
-llama.cpp
+# The llama.cpp sources, unpacked here by zig build from the pin in
+# build.zig.zon. Not vendored: this repository is the build system, not a fork.
+zig-pkg
 
 # The web UI build (`make ui`): staged sources, node_modules, dist.
 .ui

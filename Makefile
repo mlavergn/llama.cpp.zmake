@@ -4,17 +4,27 @@
 #
 # Zig build system for llama.cpp.
 #
-# The sources are not modified. This directory sits outside them and reads
-# them from ./llama.cpp, which `make clone` fetches.
+# The sources are not modified. This directory sits outside them: they are
+# the `llama_cpp` package in build.zig.zon, which zig build fetches on first
+# use into zig-pkg/<hash>.
 #
 ###############################################
 
 .DEFAULT_GOAL := build
 
-.PHONY: clone build dist lib cli run clean distclean macos ios linux linux-x86_64 windows-x86_64 ui server web
+.PHONY: fetch pin srcdir build dist lib cli run clean distclean macos ios linux linux-x86_64 windows-x86_64 ui server web
 
 # Pinned deliberately. A port against a moving target does not converge.
-LLAMA_CPP_TAG ?= v0.9.0
+#
+# build.zig.zon holds the pin, as upstream's release tarball URL and its
+# content hash; the tag is read back from that URL rather than repeated here.
+# Re-pin with `make pin LLAMA_CPP_TAG=<tag>`.
+LLAMA_CPP_TAG ?= $(shell sed -n 's|.*/archive/refs/tags/\(.*\)\.tar\.gz",$$|\1|p' build.zig.zon)
+LLAMA_CPP_URL  = https://github.com/ggml-org/llama.cpp/archive/refs/tags/$(LLAMA_CPP_TAG).tar.gz
+
+# Where Zig unpacks the pinned sources: zig-pkg/ beside build.zig, under the
+# package hash. llama_cpp is the only dependency, so the only hash.
+LLAMA_CPP_DIR := zig-pkg/$(shell sed -n 's/^ *\.hash = "\(.*\)",$$/\1/p' build.zig.zon)
 
 # The platform targets: arm64 everywhere, and x86_64 on Linux and Windows.
 # build.zig derives its whole configuration -- backends, source lists,
@@ -78,10 +88,22 @@ MODEL ?= $(or $(firstword $(wildcard $(MODEL_NAME) ../$(MODEL_NAME))),$(MODEL_NA
 VULKAN_FLAGS = $(if $(VULKAN),-Dvulkan) $(if $(GLSLC),-Dglslc=$(GLSLC)) \
                $(foreach d,$(VULKAN_INCLUDE),-Dvulkan-include=$(d))
 
-# Fetch the sources this build compiles.
-clone:
-	git clone https://github.com/ggerganov/llama.cpp.git
-	cd llama.cpp; git checkout $(LLAMA_CPP_TAG)
+# Fetch the sources this build compiles. Every zig build does this on its
+# own; this is for fetching ahead of an offline build, or before `make ui`.
+fetch:
+	zig build --fetch
+
+# Re-pin build.zig.zon to another release tag, e.g.
+#   make pin LLAMA_CPP_TAG=v0.10.0
+# build.zig's version, commit and build number are not derived from the
+# sources and still have to be updated by hand.
+pin:
+	zig fetch --save=llama_cpp $(LLAMA_CPP_URL)
+
+# Print the pinned sources' directory, for a CMake reference build of the
+# same bytes (see CLAUDE.md, "How to verify a change").
+srcdir: fetch
+	@echo "$(abspath $(LLAMA_CPP_DIR))"
 
 # Everything: ggml, libllama, and llama-cli.
 build:
@@ -145,9 +167,9 @@ UI_DIR       ?= .ui
 UI_BUILD_NUM ?= b$(shell sed -n 's/^const build_number = \([0-9]*\);/\1/p' build.zig)
 PORT         ?= 8080
 
-ui:
+ui: fetch
 	mkdir -p $(UI_DIR)
-	rsync -a --delete --exclude node_modules --exclude .svelte-kit --exclude dist llama.cpp/tools/ui/ $(UI_DIR)/src/
+	rsync -a --delete --exclude node_modules --exclude .svelte-kit --exclude dist $(LLAMA_CPP_DIR)/tools/ui/ $(UI_DIR)/src/
 	cd $(UI_DIR)/src && npm ci --no-audit --no-fund
 	rm -rf $(UI_DIR)/dist
 	cd $(UI_DIR)/src && LLAMA_UI_OUT_DIR="$(abspath $(UI_DIR))/dist" LLAMA_UI_VERSION=$(UI_BUILD_NUM) \
@@ -181,6 +203,7 @@ run:
 clean:
 	rm -rf zig-out .zig-cache
 
-# Also remove the fetched sources.
+# Also remove the fetched sources. The download stays in Zig's global cache,
+# so the next build unpacks it again without the network.
 distclean: clean
-	rm -rf llama.cpp
+	rm -rf zig-pkg
