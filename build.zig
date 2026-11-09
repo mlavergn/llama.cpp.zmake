@@ -68,10 +68,10 @@ fn srcPath(b: *std.Build, sub: []const u8) std.Build.LazyPath {
 /// `git rev-parse --short HEAD` and `build_number` the build tag's number
 /// (`git describe --tags --match 'b*'`), as cmake/build-info.cmake derives
 /// them.
-const version = "0.8.0";
-const ggml_version = "0.28.0";
-const commit = "8642541b2";
-const build_number = 11960;
+const version = "0.9.0";
+const ggml_version = "0.29.0";
+const commit = "cd959bae9";
+const build_number = 12110;
 
 /// The platforms this build knows how to configure.
 ///
@@ -621,7 +621,7 @@ fn addCommonIncludes(b: *std.Build, mod: *std.Build.Module) void {
     mod.addIncludePath(srcPath(b, "vendor"));
 }
 
-/// The shader extensions `ggml/src/ggml-vulkan/CMakeLists.txt:65-113` asks
+/// The shader extensions `ggml/src/ggml-vulkan/CMakeLists.txt:80-121` asks
 /// `glslc` about, in its order. Each one `glslc` accepts defines its macro for
 /// the shader generator and for `ggml-vulkan.cpp`, and both compile
 /// differently for it.
@@ -782,7 +782,7 @@ fn configureVulkan(b: *std.Build, platform: Platform) !?Vulkan {
 /// embeds, and `ggml-vulkan.cpp`. `addCli` links `libvulkan`.
 ///
 /// Replaces CMake's `ExternalProject` and custom commands
-/// (`ggml-vulkan/CMakeLists.txt:149-259`) with the same two passes of the
+/// (`ggml-vulkan/CMakeLists.txt:162-259`) with the same two passes of the
 /// same tool. `vulkan-shaders-gen` is upstream's generator, built for the host
 /// with the extension macros: run once with no source it writes
 /// `ggml-vulkan-shaders.hpp`, declaring every variant; run once per `.comp`
@@ -834,7 +834,7 @@ fn addVulkan(b: *std.Build, cfg: Config, vk: Vulkan, mod: *std.Build.Module) !vo
     try vk_flags.appendSlice(b.allocator, vk.features);
     for (vk.include_dirs) |dir| try vk_flags.appendSlice(b.allocator, &.{ "-idirafter", dir });
     // `CXX_VISIBILITY_PRESET hidden` and `VISIBILITY_INLINES_HIDDEN ON`
-    // (ggml-vulkan/CMakeLists.txt:73-75, since v0.5.0), so a dlclosed duplicate
+    // (ggml-vulkan/CMakeLists.txt:74-76, since v0.5.0), so a dlclosed duplicate
     // copy cannot interpose the backend's symbols.
     try vk_flags.appendSlice(b.allocator, &.{ "-fvisibility=hidden", "-fvisibility-inlines-hidden" });
 
@@ -860,6 +860,7 @@ fn addVulkan(b: *std.Build, cfg: Config, vk: Vulkan, mod: *std.Build.Module) !vo
         .files = &.{
             "ggml/src/ggml-vulkan/ggml-vulkan.cpp",
             "ggml/src/ggml-vulkan/ggml-vulkan-buffers.cpp",
+            "ggml/src/ggml-vulkan/ggml-vulkan-comm.cpp",
             "ggml/src/ggml-vulkan/ggml-vulkan-debug.cpp",
         },
         .flags = vk_flags.items,
