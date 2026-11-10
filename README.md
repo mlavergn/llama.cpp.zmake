@@ -17,7 +17,10 @@ llama.cpp.zmake/          this repository
 ├── Makefile
 ├── zig/
 │   ├── metal_embed.zig   flattens a Metal kernel for embedding
-│   └── ui-stub/          stand-in for the generated web UI assets
+│   ├── ui-stub/          stand-in for the generated web UI assets
+│   ├── ui_embed.zig      embeds a built web UI (`-Dui`)
+│   ├── verify.sh         diffs two llama-cli builds' tokens (`make verify`)
+│   └── xcframework/      packs the Apple slices into llama.xcframework
 └── zig-pkg/<hash>/       the sources, fetched by zig build (gitignored)
 ```
 
@@ -37,6 +40,8 @@ make ui        # build the web UI with npm into .ui/dist
 make server    # llama-server, the UI embedded when .ui/dist exists
 make web       # both, then serve $(MODEL) on $(PORT) (default 8080)
 make run ARGS="-m model.gguf -ngl 99 -p 'hello' -st"
+make ref       # the CMake reference llama-cli, macOS, into .ref (CMAKE=<cmake>)
+make verify    # llama-cli's tokens against it: 3 prompts, GPU and CPU (REF=<binary>)
 ```
 
 Per-platform builds of `llama-cli`, arm64 everywhere and x86_64 on Linux, each
@@ -48,6 +53,11 @@ make ios           # -> zig-out/ios/bin/llama-cli
 make linux         # -> zig-out/linux/bin/llama-cli
 make linux-x86_64  # -> zig-out/linux-x86_64/bin/llama-cli, AVX2; X86_CPU=x86_64_v4 for AVX-512
 ```
+
+`make xcframework` builds `zig-out/xcframework/llama.xcframework`: upstream's
+`build-xcframework.sh` framework, all seven Apple slices, from these
+libraries, minimum OS 26.0. `zig/xcframework/xcframework.mk` describes it and
+lists where it differs from upstream's.
 
 Requires Zig 0.17.0. `make macos` and `make ios` need the Xcode SDK — the
 macosx and iphoneos ones respectively. `make linux` cross-compiles from any
@@ -61,8 +71,10 @@ vendored libraries, `common` including the Jinja engine, `mtmd`, and the server
 implementation the CLI drives in-process.
 
 `build.zig` derives its whole configuration from the OS in the target triple.
-Everything the three platforms share matches the `-D` flags CMake was being
-driven with: static libraries, BLAS and OpenMP off, no curl.
+Everything the platforms share matches the `-D` flags CMake was being driven
+with: static libraries, BLAS and OpenMP off, no curl. `make xcframework` adds
+tvOS, visionOS, the Apple simulators and x86_64 macOS, for its libraries only,
+with ggml's BLAS backend on (`-Dblas`) as upstream's framework has it.
 
 | | Metal | Accelerate | subprocess | target |
 |--------|-------|------------|------------|--------|
@@ -167,6 +179,9 @@ Things CMake does that are easy to miss, each of which cost real debugging:
 - **`LLAMA_SUBPROCESS` is off on iOS.** CMake turns it off on mobile and WASM
   targets, where spawning a subprocess is not sandbox-friendly
   (`CMakeLists.txt:104-110`). Defining it there would compile, and be wrong.
+- **`MTMD_VIDEO` follows `LLAMA_SUBPROCESS`**, on by default and off on iOS,
+  as CMake's mtmd has it (`tools/mtmd/CMakeLists.txt:5-11`).
+  `-Dmtmd-video=false` turns it off.
 - **`_GNU_SOURCE` is required on Linux.** ggml reaches for the GNU CPU-affinity
   and allocation extensions (`ggml/src/CMakeLists.txt:152-155`). The
   POSIX-conformance macros CMake also sets globally — `_XOPEN_SOURCE=600` and
@@ -187,10 +202,9 @@ Things CMake does that are easy to miss, each of which cost real debugging:
   `INFINITY` to SDK 27's modules guard). Zig 0.17 builds it cleanly, so the
   workaround is gone. Zig's libc++ is 22.1.8 against the SDK's 22.1.6, with
   the same ABI configuration; the CMake build still links Apple's.
-- **The Apple deployment targets are 26.0, and lowering them breaks the build.**
-  At 13.0 the Xcode 26 SDK produces 145 errors: Accelerate's Sparse headers
-  annotate symbols as macOS 15.5+, and clang makes unguarded use of them an
-  error, not a warning.
+- **The Apple deployment targets are 26.0 by choice**, the floor this project
+  needs. Lower ones build: under Zig 0.17 `llama-cli` compiles and links at
+  macOS 13.0 and 13.3, though nothing there has been run.
 - **iOS pins `-Dcpu=apple_a18`; everything else defaults to the baseline.**
   Zig's aarch64 baseline already implies `DOTPROD` and `FP16_VECTOR_ARITHMETIC`
   on macOS and Linux. Under Zig 0.16 that was also what a native macOS build

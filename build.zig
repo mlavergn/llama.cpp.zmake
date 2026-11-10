@@ -14,11 +14,16 @@
 //! `zig/ui-stub` supplies an empty table. Not built: the other ~90 CMake
 //! binaries (tests, benchmarks, the other tools).
 //!
+//! `zig build xcframework -Dblas` builds one slice of the libraries upstream's
+//! `build-xcframework.sh` packs into `llama.xcframework` -- ggml with the BLAS
+//! backend, libllama, mtmd and vendor-hash -- for the Apple `-Dtarget` given.
+//! The Makefile's `xcframework` target runs it per slice and does the rest.
+//!
 //! # Configuration
 //!
-//! Three arm64 platforms, selected by `-Dtarget` and distinguished by
-//! `Platform`. Everything else matches the `-D` flags CMake was being driven
-//! with: static libraries, BLAS off, OpenMP off, no curl.
+//! Selected by `-Dtarget` and distinguished by `Platform`. Everything else
+//! matches the `-D` flags CMake was being driven with: static libraries, BLAS
+//! off unless `-Dblas`, OpenMP off, no curl.
 //!
 //!   macOS  Metal on, shader library embedded, Accelerate on, subprocess on
 //!   iOS    the same, minus subprocess -- CMake turns it off on mobile
@@ -26,6 +31,10 @@
 //!
 //! The Makefile drives all three; it owns the deployment targets and the one
 //! `-Dcpu` pin, none of which this file needs to know about.
+//!
+//! tvOS and visionOS configure as iOS does, but keep subprocess on, as CMake
+//! does; they and the Apple simulators, and macOS on x86_64, exist for the
+//! xcframework slices.
 //!
 //! `-Dvulkan` adds ggml's Vulkan backend on any of them. It needs three things
 //! from outside the Zig toolchain, as CMake's build does: `glslc` to compile
@@ -41,9 +50,11 @@
 //!   zig build cli        llama-cli
 //!   zig build lib        ggml + libllama only
 //!   zig build server     llama-server; -Dui=.ui/dist embeds the web UI
+//!   zig build xcframework one xcframework slice's libraries; needs -Dblas
 //!   zig build run -- ... build and run llama-cli
 
 const std = @import("std");
+const log = std.log.scoped(.llamacpp_build);
 const builtin = @import("builtin");
 
 /// The name of the llama.cpp sources in `build.zig.zon`.
@@ -77,23 +88,25 @@ const build_number = 12110;
 /// set is fixed: which backends exist, which sources compile, and which
 /// feature-test macros are defined all follow from the target OS.
 const Platform = enum {
+    const Self = @This();
     macos,
     ios,
+    tvos,
+    visionos,
     linux,
     windows,
 
-    /// Maps a resolved target onto a configuration this build supports.
+    /// Map a resolved target onto a configuration this build supports.
     ///
-    /// Parameters:
-    /// - `target`: the target `-Dtarget` resolved to.
-    ///
-    /// Return: the platform, or null if this build has no configuration for
-    /// that OS. The caller reports it; `detect` has no `*std.Build` to log
-    /// through.
-    fn detect(target: std.Target) ?Platform {
+    /// - `target`: The target `-Dtarget` resolved to.
+    /// - Returns: The platform, or null if this build has no configuration for
+    ///   that OS; the caller reports it.
+    fn detect(target: std.Target) ?Self {
         return switch (target.os.tag) {
             .macos => .macos,
             .ios => .ios,
+            .tvos => .tvos,
+            .visionos => .visionos,
             .linux => .linux,
             .windows => .windows,
             else => null,
@@ -105,8 +118,15 @@ const Platform = enum {
     /// The two travel together: both come from the Apple SDK, and CMake
     /// defaults `GGML_METAL` and the Accelerate lookup off the same `APPLE`
     /// check (`ggml/CMakeLists.txt:96`, `ggml-cpu/CMakeLists.txt:60`).
-    fn isApple(self: Platform) bool {
-        return self == .macos or self == .ios;
+    /// `APPLE` is true for tvOS and visionOS too, and upstream's
+    /// `build-xcframework.sh` builds Metal for both.
+    ///
+    /// - Returns: True on macOS, iOS, tvOS and visionOS.
+    fn isApple(self: *const Self) bool {
+        return switch (self.*) {
+            .macos, .ios, .tvos, .visionos => true,
+            .linux, .windows => false,
+        };
     }
 };
 
@@ -161,7 +181,9 @@ const apple_defines = [_][]const u8{
 
 /// Required by the server tools and the server's router mode. CMake turns it
 /// on everywhere except the mobile and WASM targets, where spawning a
-/// subprocess is not sandbox-friendly (`CMakeLists.txt:104-110`).
+/// subprocess is not sandbox-friendly (`CMakeLists.txt:104-110`). "Mobile"
+/// there is `CMAKE_SYSTEM_NAME` iOS and Android only: tvOS and visionOS keep
+/// it, and so do they here. Nothing in ggml, libllama or mtmd reads it.
 const subprocess_defines = [_][]const u8{"-DLLAMA_SUBPROCESS"};
 
 /// CPU affinity and some allocation interfaces are GNU extensions on Linux.
@@ -233,7 +255,23 @@ const ggml_cxx_sources = [_][]const u8{
 /// off here, and the `GGML_AVX*` definitions it pairs with the `-m` flags are
 /// read by that file alone; the kernels test the compiler's own `__AVX2__`
 /// and friends, which `-Dcpu` sets.
-const ArchSources = struct { c: []const []const u8, cxx: []const []const u8 };
+const ArchSources = struct {
+    const Self = @This();
+    c: []const []const u8,
+    cxx: []const []const u8,
+
+    /// The arch sources for `arch`.
+    ///
+    /// - `arch`: The target's CPU architecture.
+    /// - Returns: Its sources, or null for one this build has no list for.
+    fn forArch(arch: std.Target.Cpu.Arch) ?Self {
+        return switch (arch) {
+            .aarch64 => ggml_arm_sources,
+            .x86_64 => ggml_x86_sources,
+            else => null,
+        };
+    }
+};
 
 const ggml_arm_sources: ArchSources = .{
     .c = &.{"ggml/src/ggml-cpu/arch/arm/quants.c"},
@@ -245,14 +283,15 @@ const ggml_x86_sources: ArchSources = .{
     .cxx = &.{"ggml/src/ggml-cpu/arch/x86/repack.cpp"},
 };
 
-/// The arch sources for `arch`, or null for one this build has no list for.
-fn archSources(arch: std.Target.Cpu.Arch) ?ArchSources {
-    return switch (arch) {
-        .aarch64 => ggml_arm_sources,
-        .x86_64 => ggml_x86_sources,
-        else => null,
-    };
-}
+/// ggml's BLAS backend with Accelerate as its vendor, the one upstream's
+/// Apple builds default to (`ggml/CMakeLists.txt:96-98`). `GGML_USE_BLAS`
+/// is ggml_add_backend's PUBLIC definition (`ggml/src/CMakeLists.txt:435`),
+/// so it joins the global defines; `GGML_BLAS_USE_ACCELERATE` is
+/// `add_compile_definitions` in `ggml-blas/CMakeLists.txt:19-22`, a
+/// directory-scoped one, so it reaches this file alone. The two LAPACK
+/// macros beside it are already among `apple_defines`.
+const blas_sources = [_][]const u8{"ggml/src/ggml-blas/ggml-blas.cpp"};
+const blas_defines = [_][]const u8{"-DGGML_BLAS_USE_ACCELERATE"};
 
 /// The Metal backend's C++ layer. Apple platforms only.
 const metal_cxx_sources = [_][]const u8{
@@ -338,6 +377,9 @@ const common_sources = [_][]const u8{
     "common/parsers/translate-gemma.cpp",
 };
 
+/// `MTMD_VIDEO`, private to mtmd (`tools/mtmd/CMakeLists.txt:100`).
+const mtmd_video_defines = [_][]const u8{"-DMTMD_VIDEO"};
+
 /// mtmd's own sources. The per-architecture files under `models/` are globbed,
 /// as CMake does, so a new architecture does not need a build change.
 const mtmd_sources = [_][]const u8{
@@ -374,262 +416,12 @@ const cli_impl_sources = [_][]const u8{
 
 // -----------------------------------------------------------------------------
 
-/// Everything the target-specific decisions were resolved into, computed once
-/// in `build` and threaded through the `add*` functions.
-const Config = struct {
-    target: std.Build.ResolvedTarget,
-    optimize: std.lang.Optimize,
-    platform: Platform,
-
-    /// The llama.cpp sources (`src_dep`). `path` gives the lazy paths the
-    /// graph compiles; `builder.root` is the same directory, for the globs
-    /// that list it at configure time.
-    src: *std.Build.Dependency,
-
-    /// Apple SDK path. Null on Linux and Windows.
-    sdk: ?[]const u8,
-
-    /// A generated `zig libc` file pointing at the SDK's headers. Null on
-    /// Linux and Windows, where Zig ships glibc and MinGW and needs no help.
-    ///
-    /// Both Apple platforms need one, because both are named by an explicit
-    /// `-Dtarget`. Zig only sets up the SDK include chain for a *native*
-    /// target; name any triple and it treats the build as cross-compilation,
-    /// after which its clang finds no `stdio.h` and its libc++ build dies on
-    /// `mbstate_t`. Passing `-idirafter` on our own sources is not enough --
-    /// Zig builds libc++ itself, and that internal build sees none of our
-    /// flags. A libc file is the one knob that reaches it.
-    libc_file: ?std.Build.LazyPath,
-
-    /// The bare C and C++ flags, without the platform's defines. For the
-    /// vendored libraries CMake compiles without ggml's defines.
-    c_std: []const []const u8,
-    cxx_std: []const []const u8,
-
-    /// Compiler flags per language, with the platform's defines already
-    /// folded in.
-    c: []const []const u8,
-    cxx: []const []const u8,
-    objc: []const []const u8,
-
-    /// The Vulkan backend's configuration; null without `-Dvulkan`.
-    vulkan: ?Vulkan,
-
-    /// The built web UI to embed (`-Dui`, a SvelteKit `dist` directory,
-    /// relative to the build root or absolute); null for `zig/ui-stub`'s
-    /// empty table.
-    ui: ?[]const u8,
-
-    /// Whether the embedded UI is gzip-compressed (`-Dui-gzip`, upstream's
-    /// `LLAMA_UI_GZIP`, default on).
-    ui_gzip: bool,
-};
-
-/// Declares the build graph.
-///
-/// Parameters:
-/// - `b`: the build graph the steps are registered on.
-///
-/// Return: nothing on success; propagates target, SDK resolution, and
-/// directory-read failures.
-pub fn build(b: *std.Build) !void {
-    // Zig 0.17 recognises the M5 as `apple_m5`, with i8mm and SME, where 0.16
-    // fell back to the macOS baseline (`apple_m1`). The native default would
-    // therefore compile `__ARM_FEATURE_MATMUL_INT8` kernels into ggml-cpu --
-    // 158 i8mm instructions, measured -- and stop matching a build that names
-    // its triple. The default stays at the baseline; `-Dcpu=native` opts in.
-    const target = b.standardTargetOptions(.{ .default_target = .{ .cpu_model = .baseline } });
-    const optimize = b.standardOptimizeOption(.{});
-    const platform = Platform.detect(target.result) orelse {
-        std.log.err(
-            "no configuration for OS '{s}'; this build knows macos, ios, linux, and windows",
-            .{@tagName(target.result.os.tag)},
-        );
-        return error.UnsupportedTarget;
-    };
-    // ggml's arch sources are listed for arm64 and x86_64 only. Anything else
-    // would link a libggml with no quant kernels rather than fail outright,
-    // so it is caught here instead. x86_64 is Linux and Windows only: no
-    // Apple platform this build knows runs it.
-    if (archSources(target.result.cpu.arch) == null or
-        (target.result.cpu.arch == .x86_64 and platform.isApple()))
-    {
-        std.log.err(
-            "no configuration for arch '{s}' on '{s}'; ggml's arch sources are arm64, and x86_64 on Linux and Windows",
-            .{ @tagName(target.result.cpu.arch), @tagName(target.result.os.tag) },
-        );
-        return error.UnsupportedTarget;
-    }
-
-    const src = b.dependency(src_dep, .{});
-    const sdk = if (platform.isApple()) try resolveAppleSdk(b, target.result) else null;
-    const vulkan = try configureVulkan(b, platform, src);
-
-    var defs: std.ArrayList([]const u8) = .empty;
-    try defs.appendSlice(b.allocator, &base_defines);
-    if (platform.isApple()) try defs.appendSlice(b.allocator, &apple_defines);
-    if (platform != .ios) try defs.appendSlice(b.allocator, &subprocess_defines);
-    if (platform == .linux) try defs.appendSlice(b.allocator, &linux_defines);
-    if (platform == .windows) try defs.appendSlice(b.allocator, &windows_defines);
-    // Only `ggml-backend-reg.cpp` reads it, to register the backend.
-    if (vulkan != null) try defs.append(b.allocator, "-DGGML_USE_VULKAN");
-
-    const lang_c: []const []const u8 = if (platform == .windows) &gnu_c_std else &c_std;
-    const lang_cxx: []const []const u8 = if (platform == .windows) &gnu_cxx_std else &cxx_std;
-
-    const cfg = Config{
-        .target = target,
-        .optimize = optimize,
-        .platform = platform,
-        .src = src,
-        .sdk = sdk,
-        .libc_file = if (sdk) |s| writeAppleLibcFile(b, s) else null,
-        .c_std = lang_c,
-        .cxx_std = lang_cxx,
-        .c = try join(b, lang_c, defs.items),
-        .cxx = try join(b, lang_cxx, defs.items),
-        .objc = try join(b, &objc_std, defs.items),
-        .vulkan = vulkan,
-        .ui = b.option([]const u8, "ui", "Embed the web UI built in this directory (a SvelteKit dist; `make ui` writes .ui/dist). Default: no UI"),
-        .ui_gzip = b.option(bool, "ui-gzip", "gzip-compress the embedded web UI, as upstream's LLAMA_UI_GZIP (default true)") orelse true,
-    };
-
-    const ggml = try addGgml(b, cfg);
-    const llama = try addLlama(b, cfg, ggml);
-
-    const lib_step = b.step("lib", "Build ggml and libllama only");
-    lib_step.dependOn(&b.addInstallArtifact(ggml, .{}).step);
-    lib_step.dependOn(&b.addInstallArtifact(llama, .{}).step);
-
-    const exes = try addCli(b, cfg, ggml, llama);
-    const cli = exes.cli;
-    b.installArtifact(cli);
-
-    const cli_step = b.step("cli", "Build llama-cli");
-    cli_step.dependOn(&b.addInstallArtifact(cli, .{}).step);
-
-    // Not part of the default step: llama-cli is this build's deliverable.
-    const server_step = b.step("server", "Build llama-server (with the web UI under -Dui)");
-    server_step.dependOn(&b.addInstallArtifact(exes.server, .{}).step);
-
-    const run = b.addRunArtifact(cli);
-    run.step.dependOn(b.getInstallStep());
-    run.addPassthruArgs();
-    const run_step = b.step("run", "Run llama-cli");
-    run_step.dependOn(&run.step);
-}
-
-/// Concatenates two flag lists into one the build graph can hold onto.
-fn join(b: *std.Build, a: []const []const u8, c: []const []const u8) ![]const []const u8 {
-    const out = try b.allocator.alloc([]const u8, a.len + c.len);
-    @memcpy(out[0..a.len], a);
-    @memcpy(out[a.len..], c);
-    return out;
-}
-
-/// Locates the Apple SDK matching the target, for the header, framework, and
-/// library search paths.
-///
-/// Parameters:
-/// - `b`: the build graph, for its allocator and IO.
-/// - `target`: the resolved target; selects `macosx` or `iphoneos`.
-///
-/// Return: the SDK path; `error.AppleSdkNotFound` when none is installed.
-fn resolveAppleSdk(b: *std.Build, target: std.Target) ![]const u8 {
-    return std.zig.system.darwin.getSdk(b.allocator, b.graph.io, &target) orelse
-        error.AppleSdkNotFound;
-}
-
-/// Writes a `zig libc` file describing an Apple SDK.
-///
-/// Pointing both include directories at the SDK fixes the compile and, because
-/// Zig feeds the same file to its internal libc++ build, the link as well. See
-/// `Config.libc_file` for why a named triple needs this and a native one does
-/// not.
-///
-/// Zig 0.17 requires two keys it did not before: `darwin_sdk_dir`, the SDK
-/// root, and a non-empty `crt_dir`. Both take the values Zig's own native
-/// detection writes (`LibCInstallation.findNative`), so a named triple sees the
-/// same libc a native build does. The remaining keys are required by the file
-/// format and empty by design: the MSVC and cc keys are for other platforms
-/// entirely.
-///
-/// Parameters:
-/// - `b`: the build graph, for its allocator and generated-file step.
-/// - `sdk`: the macosx or iphoneos SDK root.
-///
-/// Return: a lazy path to the generated file, valid for the whole build.
-fn writeAppleLibcFile(b: *std.Build, sdk: []const u8) std.Build.LazyPath {
-    return b.addWriteFiles().add("apple-libc.txt", b.fmt(
-        \\include_dir={s}/usr/include
-        \\sys_include_dir={s}/usr/include
-        \\crt_dir={s}/usr/lib
-        \\msvc_lib_dir=
-        \\kernel32_lib_dir=
-        \\cc_dir=
-        \\darwin_sdk_dir={s}
-        \\
-    , .{ sdk, sdk, sdk, sdk }));
-}
-
-/// Applies the settings every C/C++ target in this build shares.
-fn baseModule(b: *std.Build, cfg: Config) *std.Build.Module {
-    const mod = b.createModule(.{
-        .target = cfg.target,
-        .optimize = cfg.optimize,
-        .link_libc = true,
-        .link_libcpp = true,
-        // These sources are not UBSan-clean -- they rely on pointer arithmetic
-        // that is technically undefined but universally works -- and Zig turns
-        // the C sanitizers on in Debug. CMake never enabled them.
-        .sanitize_c = .off,
-    });
-    if (cfg.sdk) |sdk| {
-        mod.addFrameworkPath(b.graph.cwdRelativePath(b.fmt("{s}/System/Library/Frameworks", .{sdk})));
-        // Only iOS needs the library path spelled out; for macOS Zig already
-        // searches the SDK, and this is the same directory it would find.
-        mod.addLibraryPath(b.graph.cwdRelativePath(b.fmt("{s}/usr/lib", .{sdk})));
-    }
-    return mod;
-}
-
-/// Wraps `b.addLibrary`, attaching the libc file when the platform needs one.
-///
-/// `libc_file` lives on the compile step rather than the module, so it cannot
-/// be set in `baseModule` and has to be applied at every construction site.
-fn addLibrary(b: *std.Build, cfg: Config, name: []const u8, mod: *std.Build.Module) *std.Build.Step.Compile {
-    const lib = b.addLibrary(.{ .name = name, .root_module = mod, .linkage = .static });
-    lib.setLibCFile(cfg.libc_file);
-    return lib;
-}
-
-/// Wraps `b.addExecutable`, attaching the libc file when the platform needs
-/// one. See `addLibrary`.
-fn addExecutable(b: *std.Build, cfg: Config, name: []const u8, mod: *std.Build.Module) *std.Build.Step.Compile {
-    const exe = b.addExecutable(.{ .name = name, .root_module = mod });
-    exe.setLibCFile(cfg.libc_file);
-    return exe;
-}
-
-/// Adds the include paths shared by everything above ggml.
-fn addCommonIncludes(cfg: Config, mod: *std.Build.Module) void {
-    mod.addIncludePath(cfg.src.path(""));
-    mod.addIncludePath(cfg.src.path("include"));
-    // Note `src` is deliberately absent. It holds a second unicode.h, and
-    // adding it here shadows common/unicode.h, which common/jinja needs.
-    // CMake keeps it PRIVATE to the llama target for the same reason.
-    mod.addIncludePath(cfg.src.path("common"));
-    mod.addIncludePath(cfg.src.path("ggml/include"));
-    mod.addIncludePath(cfg.src.path("ggml/src"));
-    // Covers both <nlohmann/json.hpp> and <cpp-httplib/httplib.h>.
-    mod.addIncludePath(cfg.src.path("vendor"));
-}
-
 /// The shader extensions `ggml/src/ggml-vulkan/CMakeLists.txt:80-121` asks
 /// `glslc` about, in its order. Each one `glslc` accepts defines its macro for
 /// the shader generator and for `ggml-vulkan.cpp`, and both compile
 /// differently for it.
 const VulkanFeature = struct {
+    const Self = @This();
     /// The extension named in `glslc`'s refusal.
     extension: []const u8,
     /// The test shader under `vulkan-shaders/feature-tests/`.
@@ -638,6 +430,7 @@ const VulkanFeature = struct {
     define: []const u8,
 };
 
+/// The extensions `configureVulkan` asks `glslc` about.
 const vulkan_features = [_]VulkanFeature{
     .{ .extension = "GL_KHR_cooperative_matrix", .test_shader = "coopmat.comp", .define = "GGML_VULKAN_COOPMAT_GLSLC_SUPPORT" },
     .{ .extension = "GL_NV_cooperative_matrix2", .test_shader = "coopmat2.comp", .define = "GGML_VULKAN_COOPMAT2_GLSLC_SUPPORT" },
@@ -653,6 +446,7 @@ const vulkan_shaders_dir = "ggml/src/ggml-vulkan/vulkan-shaders";
 
 /// What `-Dvulkan` resolved to at configure time.
 const Vulkan = struct {
+    const Self = @This();
     /// The `glslc` every shader is compiled with.
     glslc: []const u8,
     /// Directories holding `vulkan/` and `spirv/`, searched after libc's.
@@ -663,586 +457,961 @@ const Vulkan = struct {
     features: []const []const u8,
 };
 
-/// Builds ggml with its CPU backend -- and, on Apple platforms, its Metal
-/// backend, and with `-Dvulkan` its Vulkan one -- as one static archive.
-///
-/// CMake splits the backends so they can be loaded dynamically. With static
-/// linking and `GGML_BACKEND_DL` off that split carries no meaning:
-/// `ggml-backend-reg.cpp` calls each backend's registration function directly
-/// under an `#ifdef`, so one archive links identically.
-fn addGgml(b: *std.Build, cfg: Config) !*std.Build.Step.Compile {
-    const mod = baseModule(b, cfg);
+/// The generated `ui.h` and `ui.cpp`.
+const UiHeaders = struct {
+    const Self = @This();
+    /// The directory holding `ui.h`, for the include path.
+    dir: std.Build.LazyPath,
+    /// The generated `ui.cpp`, compiled into `llama-ui`.
+    cpp: std.Build.LazyPath,
+};
 
-    mod.addIncludePath(cfg.src.path("ggml/include"));
-    mod.addIncludePath(cfg.src.path("ggml/src"));
-    mod.addIncludePath(cfg.src.path("ggml/src/ggml-cpu"));
-    // ggml/src/CMakeLists.txt:216, configure_file(ggml-version.h.in).
-    mod.addConfigHeader(b.addConfigHeader(.{
-        .style = .{ .cmake = cfg.src.path("ggml/src/ggml-version.h.in") },
-        .include_path = "ggml-version.h",
-    }, .{ .GGML_VERSION = ggml_version, .GGML_BUILD_COMMIT = commit }));
+/// What `addCli` builds: the CLI, and the server over the same libraries.
+const Executables = struct {
+    const Self = @This();
+    /// `llama-cli`.
+    cli: *std.Build.Step.Compile,
+    /// `llama-server`.
+    server: *std.Build.Step.Compile,
+};
 
-    mod.addCSourceFiles(.{ .root = cfg.src.path(""), .files = &ggml_c_sources, .flags = cfg.c });
-    mod.addCSourceFiles(.{ .root = cfg.src.path(""), .files = &ggml_cxx_sources, .flags = cfg.cxx });
-    const arch = archSources(cfg.target.result.cpu.arch).?;
-    mod.addCSourceFiles(.{ .root = cfg.src.path(""), .files = arch.c, .flags = cfg.c });
-    mod.addCSourceFiles(.{ .root = cfg.src.path(""), .files = arch.cxx, .flags = cfg.cxx });
-
-    if (cfg.platform.isApple()) {
-        mod.addIncludePath(cfg.src.path("ggml/src/ggml-metal"));
-        mod.addCSourceFiles(.{ .root = cfg.src.path(""), .files = &metal_cxx_sources, .flags = cfg.cxx });
-        mod.addCSourceFiles(.{ .root = cfg.src.path(""), .files = &metal_objc_sources, .flags = cfg.objc });
-
-        for (metal_kernels) |kind| mod.addAssemblyFile(embedMetalKernel(b, cfg, kind));
-
-        mod.linkFramework("Foundation", .{});
-        mod.linkFramework("Metal", .{});
-        mod.linkFramework("MetalKit", .{});
-        mod.linkFramework("Accelerate", .{});
-    }
-
-    if (cfg.vulkan) |vk| try addVulkan(b, cfg, vk, mod);
-
-    return addLibrary(b, cfg, "ggml", mod);
-}
-
-/// Reads the `-Dvulkan` options and asks `glslc` which shader extensions it
-/// accepts, at configure time, as `ggml-vulkan/CMakeLists.txt:34-57` does.
-///
-/// CMake's test is the one reproduced: an extension is supported unless
-/// `glslc`'s diagnostics contain `extension not supported: <name>` -- any
-/// other failure still counts as support. Locating `glslc` poisons Zig's
-/// configuration cache, so every build re-asks, and a `glslc` that changes
-/// between builds cannot leave stale answers.
-///
-/// Parameters:
-/// - `b`: the build graph, for its options, allocator and process spawning.
-/// - `platform`: decides the default header directory.
-/// - `src`: the llama.cpp sources, for the feature-test shaders.
-///
-/// Return: null without `-Dvulkan`; otherwise the configuration, or an error
-/// when `glslc` or the headers cannot be found or a probe cannot run.
-fn configureVulkan(b: *std.Build, platform: Platform, src: *std.Build.Dependency) !?Vulkan {
-    const enabled = b.option(bool, "vulkan", "Build ggml's Vulkan backend (needs glslc, the Vulkan and SPIR-V headers, and libvulkan)") orelse false;
-    const glslc_opt = b.option([]const u8, "glslc", "The glslc to compile the Vulkan shaders with (default: glslc on PATH)");
-    const include_opt = b.option([]const []const u8, "vulkan-include", "Directories holding vulkan/ and spirv/, searched after libc's headers (default on Linux: /usr/include)");
-    const lib_opt = b.option([]const []const u8, "vulkan-lib", "Extra directories to find libvulkan in");
-    if (!enabled) return null;
-
-    const glslc = glslc_opt orelse b.findProgram(.{ .names = &.{"glslc"} }) orelse {
-        std.log.err("-Dvulkan needs glslc: put it on PATH or pass -Dglslc=<path>", .{});
-        return error.GlslcNotFound;
-    };
-    const include_dirs: []const []const u8 = include_opt orelse if (platform == .linux)
-        &.{"/usr/include"}
-    else {
-        std.log.err("-Dvulkan on {s} needs -Dvulkan-include=<dir holding vulkan/ and spirv/>", .{@tagName(platform)});
-        return error.VulkanHeadersNotFound;
-    };
-
-    // The probes below count any output but a refusal as support, so a
-    // `glslc` that cannot run at all would pass every one of them: make sure
-    // it runs first.
-    switch (b.runFallible(&.{ glslc, "--version" }, .{ .stderr_behavior = .ignore })) {
-        .success => {},
-        else => {
-            std.log.err("-Dvulkan: {s} does not run", .{glslc});
-            return error.GlslcNotFound;
-        },
-    }
-
-    var features: std.ArrayList([]const u8) = .empty;
-    for (vulkan_features) |f| {
-        const rel = b.fmt("{s}/feature-tests/{s}", .{ vulkan_shaders_dir, f.test_shader });
-        b.dependOnFileContents(src.path(rel));
-        const test_shader = try src.builder.root.joinString(b.allocator, rel);
-        // glslc's diagnostics go to stderr and it exits non-zero on the
-        // refusal, so the shell folds both into a successful stdout.
-        const out = switch (b.runFallible(&.{
-            "sh",                                                                                       "-c",
-            "\"$0\" -o - -fshader-stage=compute --target-env=vulkan1.3 \"$1\" 2>&1 >/dev/null; exit 0", glslc,
-            test_shader,
-        }, .{ .stderr_behavior = .ignore })) {
-            .success => |stdout| stdout,
-            else => {
-                std.log.err("could not run {s} on {s}", .{ glslc, test_shader });
-                return error.GlslcProbeFailed;
-            },
-        };
-        const refusal = b.fmt("extension not supported: {s}", .{f.extension});
-        if (std.mem.indexOf(u8, out, refusal) == null) {
-            try features.append(b.allocator, b.fmt("-D{s}", .{f.define}));
-        }
-    }
-
-    return .{
-        .glslc = glslc,
-        .include_dirs = include_dirs,
-        .lib_dirs = lib_opt orelse &.{},
-        .features = features.items,
-    };
-}
-
-/// Adds ggml's Vulkan backend to `mod`: the shader generator, the SPIR-V it
-/// embeds, and `ggml-vulkan.cpp`. `addCli` links `libvulkan`.
-///
-/// Replaces CMake's `ExternalProject` and custom commands
-/// (`ggml-vulkan/CMakeLists.txt:162-259`) with the same two passes of the
-/// same tool. `vulkan-shaders-gen` is upstream's generator, built for the host
-/// with the extension macros: run once with no source it writes
-/// `ggml-vulkan-shaders.hpp`, declaring every variant; run once per `.comp`
-/// with `--glslc` it compiles that file's variants and writes a `.cpp`
-/// holding their SPIR-V. Each run is a separate, cached step, so the 155
-/// shader files compile in parallel and only a changed one recompiles.
-///
-/// Every `.comp` and `.glsl` is an input of every run: a shader's includes
-/// are resolved by `glslc`, which Zig cannot see.
-///
-/// Parameters:
-/// - `b`: the build graph.
-/// - `cfg`: the platform's flags.
-/// - `vk`: what `configureVulkan` resolved.
-/// - `mod`: ggml's module, which gains the backend's sources and link.
-///
-/// Return: nothing; propagates directory-read failures.
-fn addVulkan(b: *std.Build, cfg: Config, vk: Vulkan, mod: *std.Build.Module) !void {
-    const gen_mod = b.createModule(.{
-        .target = b.graph.host,
-        .optimize = .fast,
-        .link_libc = true,
-        .link_libcpp = true,
-        .sanitize_c = .off,
-    });
-    gen_mod.addCSourceFile(.{
-        .file = cfg.src.path(vulkan_shaders_dir ++ "/vulkan-shaders-gen.cpp"),
-        .flags = try join(b, &cxx_std, vk.features),
-    });
-    const gen = b.addExecutable(.{ .name = "vulkan-shaders-gen", .root_module = gen_mod });
-
-    var comp: std.ArrayList([]const u8) = .empty;
-    try appendGlob(b, cfg, &comp, vulkan_shaders_dir, ".comp");
-    var glsl: std.ArrayList([]const u8) = .empty;
-    try appendGlob(b, cfg, &glsl, vulkan_shaders_dir, ".glsl");
-
-    // Pass 1: the header, which names every variant.
-    const hdr_run = b.addRunArtifact(gen);
-    hdr_run.addArg("--output-dir");
-    _ = hdr_run.addOutputDirectoryArg("spv");
-    hdr_run.addArg("--target-hpp");
-    const header = hdr_run.addOutputFileArg("ggml-vulkan-shaders.hpp");
-    mod.addIncludePath(header.dirname());
-
-    // `-idirafter`, not `-I`: the header directory is usually `/usr/include`,
-    // which must not shadow the libc headers Zig supplies.
-    var vk_flags: std.ArrayList([]const u8) = .empty;
-    try vk_flags.appendSlice(b.allocator, cfg.cxx);
-    try vk_flags.appendSlice(b.allocator, vk.features);
-    for (vk.include_dirs) |dir| try vk_flags.appendSlice(b.allocator, &.{ "-idirafter", dir });
-    // `CXX_VISIBILITY_PRESET hidden` and `VISIBILITY_INLINES_HIDDEN ON`
-    // (ggml-vulkan/CMakeLists.txt:74-76, since v0.5.0), so a dlclosed duplicate
-    // copy cannot interpose the backend's symbols.
-    try vk_flags.appendSlice(b.allocator, &.{ "-fvisibility=hidden", "-fvisibility-inlines-hidden" });
-
-    // Pass 2: one run per shader file, each writing that file's SPIR-V.
-    for (comp.items) |file| {
-        const run = b.addRunArtifact(gen);
-        run.addArgs(&.{ "--glslc", vk.glslc });
-        run.addArg("--source");
-        run.addFileArg(cfg.src.path(file));
-        run.addArg("--output-dir");
-        _ = run.addOutputDirectoryArg("spv");
-        // Only its basename is used, for the generated `#include`.
-        run.addArgs(&.{ "--target-hpp", "ggml-vulkan-shaders.hpp" });
-        run.addArg("--target-cpp");
-        const cpp = run.addOutputFileArg(b.fmt("{s}.cpp", .{std.fs.path.basename(file)}));
-        for (comp.items) |f| run.addFileInput(cfg.src.path(f));
-        for (glsl.items) |f| run.addFileInput(cfg.src.path(f));
-        mod.addCSourceFile(.{ .file = cpp, .flags = cfg.cxx });
-    }
-
-    mod.addCSourceFiles(.{
-        .root = cfg.src.path(""),
-        .files = &.{
-            "ggml/src/ggml-vulkan/ggml-vulkan.cpp",
-            "ggml/src/ggml-vulkan/ggml-vulkan-buffers.cpp",
-            "ggml/src/ggml-vulkan/ggml-vulkan-comm.cpp",
-            "ggml/src/ggml-vulkan/ggml-vulkan-debug.cpp",
-        },
-        .flags = vk_flags.items,
-    });
-    // `libvulkan` is linked by the executable, in `addCli`, not here: Zig
-    // resolves a system library even for a static archive, which links
-    // nothing, and a machine that only builds the archive -- for a harness
-    // that links it itself -- need not have the loader installed.
-}
-
-/// Flattens one Metal kernel and returns the assembly stub that embeds it.
-///
-/// Replaces the `cat`/`sed` pipeline CMake runs under
-/// `GGML_METAL_EMBED_LIBRARY`. The stub `.incbin`s the flattened shader
-/// *source* into a `__DATA,__ggml_metallib` section; the Metal driver compiles
-/// it at load time, so no `xcrun metal` step is involved. That is also why
-/// this works unchanged for iOS: nothing here is host-specific.
-///
-/// Never switch to the non-embedded path: that one does need `xcrun metal`,
-/// which the Zig toolchain cannot replace.
-fn embedMetalKernel(b: *std.Build, cfg: Config, kind: []const u8) std.Build.LazyPath {
-    const tool = b.addExecutable(.{
-        .name = "metal_embed",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("zig/metal_embed.zig"),
-            .target = b.graph.host,
-            .optimize = .debug,
-        }),
-    });
-
-    const run = b.addRunArtifact(tool);
-    run.addArg(kind);
-    _ = run.addOutputFileArg(b.fmt("ggml-metal-embed-{s}.metal", .{kind}));
-    const out_asm = run.addOutputFileArg(b.fmt("ggml-metal-embed-{s}.s", .{kind}));
-
-    run.addFileArg(cfg.src.path("ggml/src/ggml-common.h"));
-    run.addFileArg(cfg.src.path("ggml/src/ggml-metal/ggml-metal-impl.h"));
-    run.addFileArg(cfg.src.path("ggml/src/ggml-metal/kernels/common.h"));
-    run.addFileArg(cfg.src.path("ggml/src/ggml-metal/kernels/dequantize.h"));
-    run.addFileArg(cfg.src.path("ggml/src/ggml-metal/kernels/quantize.h"));
-    run.addFileArg(cfg.src.path("ggml/src/ggml-metal/kernels/fa_common.metal"));
-    run.addFileArg(cfg.src.path("ggml/src/ggml-metal/kernels/fa_vec_common.metal"));
-    run.addFileArg(cfg.src.path(b.fmt("ggml/src/ggml-metal/kernels/{s}.metal", .{kind})));
-
-    return out_asm;
-}
-
-/// Builds libllama, including every architecture under `src/models/`.
-///
-/// The architectures are read from the directory rather than listed, as
-/// CMake's `file(GLOB)` does, so adding one needs no build change.
-fn addLlama(b: *std.Build, cfg: Config, ggml: *std.Build.Step.Compile) !*std.Build.Step.Compile {
-    const mod = baseModule(b, cfg);
-    addCommonIncludes(cfg, mod);
-    // Private to this target; see addCommonIncludes.
-    mod.addIncludePath(cfg.src.path("src"));
-    // src/CMakeLists.txt:66, configure_file(llama-version.h.in).
-    mod.addConfigHeader(b.addConfigHeader(.{
-        .style = .{ .cmake = cfg.src.path("src/llama-version.h.in") },
-        .include_path = "llama-version.h",
-    }, .{ .LLAMA_VERSION = version, .LLAMA_BUILD_COMMIT = commit }));
-
-    var files: std.ArrayList([]const u8) = .empty;
-    try files.appendSlice(b.allocator, &llama_sources);
-    try appendGlob(b, cfg, &files, "src/models", ".cpp");
-
-    mod.addCSourceFiles(.{
-        .root = cfg.src.path(""),
-        .files = files.items,
-        .flags = cfg.cxx,
-    });
-    mod.linkLibrary(ggml);
-
-    return addLibrary(b, cfg, "llama", mod);
-}
-
-/// Builds `llama-cli` and everything it links.
-///
-/// The dependency chain, from CMake: llama-cli -> llama-cli-impl ->
-/// llama-server-impl -> {server-context, llama-ui, cpp-httplib} ->
-/// {llama-common, mtmd} -> {llama, ggml, vendor}. The CLI pulls in the whole
-/// server because `cli-context.cpp` drives it in-process.
-fn addCli(
+/// Everything the target-specific decisions were resolved into, computed once
+/// by `init`, and the methods that declare every target from them.
+const Config = struct {
+    const Self = @This();
+    /// The build graph every target is declared on.
     b: *std.Build,
-    cfg: Config,
-    ggml: *std.Build.Step.Compile,
-    llama: *std.Build.Step.Compile,
-) !Executables {
-    // vendor::hash, needed by mtmd.
-    const hash = blk: {
-        const mod = baseModule(b, cfg);
-        mod.addIncludePath(cfg.src.path("vendor"));
-        mod.addIncludePath(cfg.src.path("vendor/hash"));
+    /// What `-Dtarget` and `-Dcpu` resolved to.
+    target: std.Build.ResolvedTarget,
+    /// What `--release` / `-Doptimize` resolved to.
+    optimize: std.lang.Optimize,
+    /// The configuration `target`'s OS selects.
+    platform: Platform,
+
+    /// The llama.cpp sources (`src_dep`). `path` gives the lazy paths the
+    /// graph compiles; `builder.root` is the same directory, for the globs
+    /// that list it at configure time.
+    src: *std.Build.Dependency,
+
+    /// Apple SDK path. Null on Linux and Windows.
+    sdk: ?[]const u8 = null,
+
+    /// Whether ggml gains its BLAS backend over Accelerate (`-Dblas`).
+    blas: bool = false,
+
+    /// Whether mtmd is compiled with `MTMD_VIDEO` (`-Dmtmd-video`): video
+    /// input, decoded by an `ffmpeg` subprocess. CMake's `MTMD_VIDEO` is on
+    /// by default and forced off without `LLAMA_SUBPROCESS`
+    /// (`tools/mtmd/CMakeLists.txt:5-11`), so it is off on iOS whatever the
+    /// option says.
+    mtmd_video: bool = false,
+
+    /// A generated `zig libc` file pointing at the SDK's headers. Null on
+    /// Linux and Windows, where Zig ships glibc and MinGW and needs no help.
+    ///
+    /// Every Apple platform needs one, because each is named by an explicit
+    /// `-Dtarget`. Zig only sets up the SDK include chain for a *native*
+    /// target; name any triple and it treats the build as cross-compilation,
+    /// after which its clang finds no `stdio.h` and its libc++ build dies on
+    /// `mbstate_t`. Passing `-idirafter` on our own sources is not enough --
+    /// Zig builds libc++ itself, and that internal build sees none of our
+    /// flags. A libc file is the one knob that reaches it.
+    libc_file: ?std.Build.LazyPath = null,
+
+    /// The bare C and C++ flags, without the platform's defines. For the
+    /// vendored libraries CMake compiles without ggml's defines.
+    c_std: []const []const u8,
+    cxx_std: []const []const u8,
+
+    /// Compiler flags per language, with the platform's defines already
+    /// folded in.
+    c: []const []const u8,
+    cxx: []const []const u8,
+    objc: []const []const u8,
+
+    /// The Vulkan backend's configuration; null without `-Dvulkan`.
+    vulkan: ?Vulkan = null,
+
+    /// The built web UI to embed (`-Dui`, a SvelteKit `dist` directory,
+    /// relative to the build root or absolute); null for `zig/ui-stub`'s
+    /// empty table.
+    ui: ?[]const u8 = null,
+
+    /// Whether the embedded UI is gzip-compressed (`-Dui-gzip`, upstream's
+    /// `LLAMA_UI_GZIP`, default on).
+    ui_gzip: bool = true,
+
+    /// Resolve the target, the platform and every option into a
+    /// configuration.
+    ///
+    /// - `b`: The build graph, whose options are read and which every target
+    ///   is later declared on.
+    /// - Returns: The configuration; `error.UnsupportedTarget` for an OS or
+    ///   architecture this build has no configuration for, and SDK
+    ///   resolution and `-Dvulkan` probe failures.
+    pub fn init(b: *std.Build) !Self {
+        // Zig 0.17 recognises the M5 as `apple_m5`, with i8mm and SME, where
+        // 0.16 fell back to the macOS baseline (`apple_m1`). The native default
+        // would therefore compile `__ARM_FEATURE_MATMUL_INT8` kernels into
+        // ggml-cpu -- 158 i8mm instructions, measured -- and stop matching a
+        // build that names its triple. The default stays at the baseline;
+        // `-Dcpu=native` opts in.
+        const target = b.standardTargetOptions(.{ .default_target = .{ .cpu_model = .baseline } });
+        const optimize = b.standardOptimizeOption(.{});
+        const platform = Platform.detect(target.result) orelse {
+            log.err(
+                "no configuration for OS '{s}'; this build knows macos, ios, tvos, visionos, linux, and windows",
+                .{@tagName(target.result.os.tag)},
+            );
+            return error.UnsupportedTarget;
+        };
+        // ggml's arch sources are listed for arm64 and x86_64 only. Anything
+        // else would link a libggml with no quant kernels rather than fail
+        // outright, so it is caught here instead. On Apple platforms x86_64 is
+        // macOS and the simulators -- the xcframework's universal slices --
+        // since no Apple device runs it.
+        const apple_x86_ok = platform == .macos or target.result.abi == .simulator;
+        if (ArchSources.forArch(target.result.cpu.arch) == null or
+            (target.result.cpu.arch == .x86_64 and platform.isApple() and !apple_x86_ok))
+        {
+            log.err(
+                "no configuration for arch '{s}' on '{s}'; ggml's arch sources are arm64, and x86_64 on Linux, Windows, macOS and the Apple simulators",
+                .{ @tagName(target.result.cpu.arch), @tagName(target.result.os.tag) },
+            );
+            return error.UnsupportedTarget;
+        }
+
+        const src = b.dependency(src_dep, .{});
+        const sdk = if (platform.isApple()) try resolveAppleSdk(b, target.result) else null;
+        const vulkan = try configureVulkan(b, platform, src);
+        const blas = b.option(bool, "blas", "Build ggml's BLAS backend over Accelerate, as upstream's Apple builds do by default (Apple targets only)") orelse false;
+        if (blas and !platform.isApple()) {
+            log.err("-Dblas: only the Accelerate vendor is configured, which is Apple's", .{});
+            return error.UnsupportedTarget;
+        }
+
+        var defs: std.ArrayList([]const u8) = .empty;
+        try defs.appendSlice(b.allocator, &base_defines);
+        if (platform.isApple()) try defs.appendSlice(b.allocator, &apple_defines);
+        const subprocess = platform != .ios;
+        if (subprocess) try defs.appendSlice(b.allocator, &subprocess_defines);
+        if (platform == .linux) try defs.appendSlice(b.allocator, &linux_defines);
+        if (platform == .windows) try defs.appendSlice(b.allocator, &windows_defines);
+        // Only `ggml-backend-reg.cpp` reads it, to register the backend.
+        if (vulkan != null) try defs.append(b.allocator, "-DGGML_USE_VULKAN");
+        if (blas) try defs.append(b.allocator, "-DGGML_USE_BLAS");
+
+        // Declared on every platform, so passing it is never an error, then
+        // forced off without subprocess support, as CMake forces it
+        // (`MTMD_VIDEO AND NOT LLAMA_SUBPROCESS`, tools/mtmd/CMakeLists.txt:8).
+        const mtmd_video_opt = b.option(bool, "mtmd-video", "Compile mtmd's video input (MTMD_VIDEO; needs ffmpeg at run time), as CMake does by default; always off on iOS") orelse true;
+        const mtmd_video = mtmd_video_opt and subprocess;
+
+        const lang_c: []const []const u8 = if (platform == .windows) &gnu_c_std else &c_std;
+        const lang_cxx: []const []const u8 = if (platform == .windows) &gnu_cxx_std else &cxx_std;
+
+        return .{
+            .b = b,
+            .target = target,
+            .optimize = optimize,
+            .platform = platform,
+            .src = src,
+            .sdk = sdk,
+            .blas = blas,
+            .mtmd_video = mtmd_video,
+            .libc_file = if (sdk) |s| writeAppleLibcFile(b, s) else null,
+            .c_std = lang_c,
+            .cxx_std = lang_cxx,
+            .c = try join(b, lang_c, defs.items),
+            .cxx = try join(b, lang_cxx, defs.items),
+            .objc = try join(b, &objc_std, defs.items),
+            .vulkan = vulkan,
+            .ui = b.option([]const u8, "ui", "Embed the web UI built in this directory (a SvelteKit dist; `make ui` writes .ui/dist). Default: no UI"),
+            .ui_gzip = b.option(bool, "ui-gzip", "gzip-compress the embedded web UI, as upstream's LLAMA_UI_GZIP (default true)") orelse true,
+        };
+    }
+
+    /// Build ggml with its CPU backend -- and, on Apple platforms, its Metal
+    /// backend, with `-Dblas` its BLAS backend, and with `-Dvulkan` its Vulkan
+    /// one -- as one static archive.
+    ///
+    /// CMake splits the backends so they can be loaded dynamically. With static
+    /// linking and `GGML_BACKEND_DL` off that split carries no meaning:
+    /// `ggml-backend-reg.cpp` calls each backend's registration function directly
+    /// under an `#ifdef`, so one archive links identically.
+    ///
+    /// - Returns: The archive; propagates directory-read failures.
+    pub fn addGgml(self: *const Self) !*std.Build.Step.Compile {
+        const b = self.b;
+        const mod = self.baseModule();
+
+        mod.addIncludePath(self.src.path("ggml/include"));
+        mod.addIncludePath(self.src.path("ggml/src"));
+        mod.addIncludePath(self.src.path("ggml/src/ggml-cpu"));
+        // ggml/src/CMakeLists.txt:216, configure_file(ggml-version.h.in).
+        mod.addConfigHeader(b.addConfigHeader(.{
+            .style = .{ .cmake = self.src.path("ggml/src/ggml-version.h.in") },
+            .include_path = "ggml-version.h",
+        }, .{ .GGML_VERSION = ggml_version, .GGML_BUILD_COMMIT = commit }));
+
+        mod.addCSourceFiles(.{ .root = self.src.path(""), .files = &ggml_c_sources, .flags = self.c });
+        mod.addCSourceFiles(.{ .root = self.src.path(""), .files = &ggml_cxx_sources, .flags = self.cxx });
+        const arch = ArchSources.forArch(self.target.result.cpu.arch).?;
+        mod.addCSourceFiles(.{ .root = self.src.path(""), .files = arch.c, .flags = self.c });
+        mod.addCSourceFiles(.{ .root = self.src.path(""), .files = arch.cxx, .flags = self.cxx });
+
+        if (self.platform.isApple()) {
+            mod.addIncludePath(self.src.path("ggml/src/ggml-metal"));
+            mod.addCSourceFiles(.{ .root = self.src.path(""), .files = &metal_cxx_sources, .flags = self.cxx });
+            mod.addCSourceFiles(.{ .root = self.src.path(""), .files = &metal_objc_sources, .flags = self.objc });
+
+            // One host tool for every kernel, run once per kernel.
+            const tool = b.addExecutable(.{
+                .name = "metal_embed",
+                .root_module = b.createModule(.{
+                    .root_source_file = b.path("zig/metal_embed.zig"),
+                    .target = b.graph.host,
+                    .optimize = .debug,
+                }),
+            });
+            for (metal_kernels) |kind| mod.addAssemblyFile(self.embedMetalKernel(tool, kind));
+
+            mod.linkFramework("Foundation", .{});
+            mod.linkFramework("Metal", .{});
+            mod.linkFramework("MetalKit", .{});
+            mod.linkFramework("Accelerate", .{});
+        }
+
+        if (self.blas) {
+            mod.addCSourceFiles(.{ .root = self.src.path(""), .files = &blas_sources, .flags = try join(b, self.cxx, &blas_defines) });
+        }
+
+        if (self.vulkan) |vk| try self.addVulkan(vk, mod);
+
+        return self.addLibrary("ggml", mod);
+    }
+
+    /// Build libllama, including every architecture under `src/models/`.
+    ///
+    /// The architectures are read from the directory rather than listed, as
+    /// CMake's `file(GLOB)` does, so adding one needs no build change.
+    ///
+    /// - `ggml`: The ggml archive libllama links.
+    /// - Returns: The archive; propagates directory-read failures.
+    pub fn addLlama(self: *const Self, ggml: *std.Build.Step.Compile) !*std.Build.Step.Compile {
+        const b = self.b;
+        const mod = self.baseModule();
+        self.addCommonIncludes(mod);
+        // Private to this target; see addCommonIncludes.
+        mod.addIncludePath(self.src.path("src"));
+        // src/CMakeLists.txt:66, configure_file(llama-version.h.in).
+        mod.addConfigHeader(b.addConfigHeader(.{
+            .style = .{ .cmake = self.src.path("src/llama-version.h.in") },
+            .include_path = "llama-version.h",
+        }, .{ .LLAMA_VERSION = version, .LLAMA_BUILD_COMMIT = commit }));
+
+        var files: std.ArrayList([]const u8) = .empty;
+        try files.appendSlice(b.allocator, &llama_sources);
+        try self.appendGlob(&files, "src/models", ".cpp");
+
         mod.addCSourceFiles(.{
-            .root = cfg.src.path(""),
+            .root = self.src.path(""),
+            .files = files.items,
+            .flags = self.cxx,
+        });
+        mod.linkLibrary(ggml);
+
+        return self.addLibrary("llama", mod);
+    }
+
+    /// Build vendor::hash (`vendor/hash/CMakeLists.txt`), which mtmd links.
+    ///
+    /// - Returns: The archive.
+    pub fn addVendorHash(self: *const Self) *std.Build.Step.Compile {
+        const mod = self.baseModule();
+        mod.addIncludePath(self.src.path("vendor"));
+        mod.addIncludePath(self.src.path("vendor/hash"));
+        mod.addCSourceFiles(.{
+            .root = self.src.path(""),
             .files = &[_][]const u8{"vendor/hash/hash.cpp"},
-            .flags = cfg.cxx_std,
+            .flags = self.cxx_std,
         });
         // sha1.c is C++ despite the extension. CMake sets LANGUAGE CXX on it
         // (vendor/hash/CMakeLists.txt:32) because the file wraps itself in a
         // namespace to avoid clashing with boringssl's symbols.
         mod.addCSourceFiles(.{
-            .root = cfg.src.path(""),
+            .root = self.src.path(""),
             .files = &[_][]const u8{"vendor/hash/sha1/sha1.c"},
-            .flags = cfg.cxx_std,
+            .flags = self.cxx_std,
             .language = .cpp,
         });
         mod.addCSourceFiles(.{
-            .root = cfg.src.path(""),
+            .root = self.src.path(""),
             .files = &[_][]const u8{
                 "vendor/hash/xxhash/xxhash.c",
                 "vendor/hash/sha256/sha256.c",
             },
-            .flags = cfg.c_std,
+            .flags = self.c_std,
         });
-        break :blk addLibrary(b, cfg, "vendor-hash", mod);
-    };
 
-    // cpp-httplib, needed by the server and by common's downloader.
-    const httplib = blk: {
-        const mod = baseModule(b, cfg);
-        mod.addIncludePath(cfg.src.path("vendor"));
-        mod.addIncludePath(cfg.src.path("vendor/cpp-httplib"));
-        mod.addCSourceFiles(.{
-            .root = cfg.src.path(""),
-            .files = &[_][]const u8{"vendor/cpp-httplib/httplib.cpp"},
-            .flags = try join(b, cfg.cxx_std, &httplib_defines),
-        });
-        // vendor/cpp-httplib/CMakeLists.txt:23, `WIN32 AND NOT MSVC`.
-        if (cfg.platform == .windows) mod.linkSystemLibrary("ws2_32", .{});
-        break :blk addLibrary(b, cfg, "cpp-httplib", mod);
-    };
+        return self.addLibrary("vendor-hash", mod);
+    }
 
-    // llama-common-base: just build-info.cpp, configured from upstream's
-    // build-info.cpp.in as common/CMakeLists.txt does. The resolved target is
-    // only known at configure time, so the triple is formatted.
-    const build_info = b.addConfigHeader(.{
-        .style = .{ .cmake = cfg.src.path("common/build-info.cpp.in") },
-        .include_path = "build-info.cpp",
-    }, .{
-        .LLAMA_BUILD_NUMBER = build_number,
-        .LLAMA_BUILD_COMMIT = commit,
-        .BUILD_COMPILER = b.fmt("Zig {s} clang", .{builtin.zig_version_string}),
-        .BUILD_TARGET = b.fmt("{s}-{s}", .{
-            @tagName(cfg.target.result.cpu.arch),
-            @tagName(cfg.target.result.os.tag),
-        }),
-    }).getOutputFile();
-
-    const common_base = blk: {
-        const mod = baseModule(b, cfg);
-        addCommonIncludes(cfg, mod);
-        mod.addCSourceFile(.{ .file = build_info, .flags = cfg.cxx });
-        break :blk addLibrary(b, cfg, "llama-common-base", mod);
-    };
-
-    // mtmd: multimodal support. The CLI links it through server-context.
-    const mtmd = blk: {
-        const mod = baseModule(b, cfg);
-        addCommonIncludes(cfg, mod);
-        mod.addIncludePath(cfg.src.path("tools/mtmd"));
-        mod.addIncludePath(cfg.src.path("vendor/hash"));
+    /// Build mtmd, multimodal support. The CLI links it through server-context;
+    /// the xcframework carries it as upstream's does (`LLAMA_BUILD_MTMD=ON`).
+    ///
+    /// `MTMD_VIDEO` is a private definition (`tools/mtmd/CMakeLists.txt:100`),
+    /// read by `mtmd-helper.cpp`, whose video path includes the header-only
+    /// `vendor/sheredom/subprocess.h` from the `vendor` include path; see
+    /// `mtmd_video` for when it is on. `build-xcframework.sh` turns it off for
+    /// every slice but macOS, and so does the Makefile's `xcframework`.
+    ///
+    /// - `ggml`: The ggml archive.
+    /// - `llama`: The libllama archive.
+    /// - `hash`: The vendor-hash archive.
+    /// - Returns: The archive; propagates directory-read failures.
+    pub fn addMtmd(
+        self: *const Self,
+        ggml: *std.Build.Step.Compile,
+        llama: *std.Build.Step.Compile,
+        hash: *std.Build.Step.Compile,
+    ) !*std.Build.Step.Compile {
+        const b = self.b;
+        const mod = self.baseModule();
+        self.addCommonIncludes(mod);
+        mod.addIncludePath(self.src.path("tools/mtmd"));
+        mod.addIncludePath(self.src.path("vendor/hash"));
 
         var files: std.ArrayList([]const u8) = .empty;
         try files.appendSlice(b.allocator, &mtmd_sources);
-        try appendGlob(b, cfg, &files, "tools/mtmd/models", ".cpp");
+        try self.appendGlob(&files, "tools/mtmd/models", ".cpp");
 
-        mod.addCSourceFiles(.{ .root = cfg.src.path(""), .files = files.items, .flags = cfg.cxx });
+        const flags = if (self.mtmd_video) try join(b, self.cxx, &mtmd_video_defines) else self.cxx;
+        mod.addCSourceFiles(.{ .root = self.src.path(""), .files = files.items, .flags = flags });
         mod.linkLibrary(llama);
         mod.linkLibrary(ggml);
         mod.linkLibrary(hash);
-        break :blk addLibrary(b, cfg, "mtmd", mod);
-    };
 
-    const common = blk: {
-        const mod = baseModule(b, cfg);
-        addCommonIncludes(cfg, mod);
-        mod.addIncludePath(cfg.src.path("tools/mtmd"));
-        mod.addCSourceFiles(.{ .root = cfg.src.path(""), .files = &common_sources, .flags = cfg.cxx });
-        mod.linkLibrary(common_base);
-        mod.linkLibrary(httplib);
-        mod.linkLibrary(llama);
-        mod.linkLibrary(ggml);
-        break :blk addLibrary(b, cfg, "llama-common", mod);
-    };
+        return self.addLibrary("mtmd", mod);
+    }
 
-    // The web UI: upstream's bundle embedded under -Dui, else the stub.
-    const ui_headers = if (cfg.ui) |dist| try embedUi(b, cfg, dist) else null;
-    const ui_include = if (ui_headers) |h| h.dir else b.path("zig/ui-stub");
-    const ui = blk: {
-        const mod = baseModule(b, cfg);
-        mod.addIncludePath(ui_include);
-        if (ui_headers) |h| {
-            // tools/ui/CMakeLists.txt:63, add_library(llama-ui ui.cpp) with cxx_std_17.
-            mod.addCSourceFile(.{ .file = h.cpp, .flags = cfg.cxx_std });
-        } else {
+    /// Build `llama-cli` and everything it links, and `llama-server` over the
+    /// same libraries.
+    ///
+    /// The dependency chain, from CMake: llama-cli -> llama-cli-impl ->
+    /// llama-server-impl -> {server-context, llama-ui, cpp-httplib} ->
+    /// {llama-common, mtmd} -> {llama, ggml, vendor}. The CLI pulls in the whole
+    /// server because `cli-context.cpp` drives it in-process.
+    ///
+    /// - `ggml`: The ggml archive.
+    /// - `llama`: The libllama archive.
+    /// - `mtmd`: The mtmd archive.
+    /// - Returns: Both executables; propagates UI-embedding failures.
+    pub fn addCli(
+        self: *const Self,
+        ggml: *std.Build.Step.Compile,
+        llama: *std.Build.Step.Compile,
+        mtmd: *std.Build.Step.Compile,
+    ) !Executables {
+        const b = self.b;
+        // cpp-httplib, needed by the server and by common's downloader.
+        const httplib = blk: {
+            const mod = self.baseModule();
+            mod.addIncludePath(self.src.path("vendor"));
+            mod.addIncludePath(self.src.path("vendor/cpp-httplib"));
             mod.addCSourceFiles(.{
-                .files = &[_][]const u8{"zig/ui-stub/ui.cpp"},
-                .flags = cfg.cxx_std,
+                .root = self.src.path(""),
+                .files = &[_][]const u8{"vendor/cpp-httplib/httplib.cpp"},
+                .flags = try join(b, self.cxx_std, &httplib_defines),
             });
-        }
-        break :blk addLibrary(b, cfg, "llama-ui", mod);
-    };
+            // vendor/cpp-httplib/CMakeLists.txt:23, `WIN32 AND NOT MSVC`.
+            if (self.platform == .windows) mod.linkSystemLibrary("ws2_32", .{});
+            break :blk self.addLibrary("cpp-httplib", mod);
+        };
 
-    const server_context = blk: {
-        const mod = baseModule(b, cfg);
-        addCommonIncludes(cfg, mod);
-        mod.addIncludePath(cfg.src.path("tools/mtmd"));
-        mod.addIncludePath(cfg.src.path("tools/server"));
-        mod.addCSourceFiles(.{ .root = cfg.src.path(""), .files = &server_context_sources, .flags = cfg.cxx });
-        mod.linkLibrary(common);
-        mod.linkLibrary(mtmd);
-        break :blk addLibrary(b, cfg, "server-context", mod);
-    };
+        // llama-common-base: just build-info.cpp, configured from upstream's
+        // build-info.cpp.in as common/CMakeLists.txt does. The resolved target is
+        // only known at configure time, so the triple is formatted.
+        const build_info = b.addConfigHeader(.{
+            .style = .{ .cmake = self.src.path("common/build-info.cpp.in") },
+            .include_path = "build-info.cpp",
+        }, .{
+            .LLAMA_BUILD_NUMBER = build_number,
+            .LLAMA_BUILD_COMMIT = commit,
+            .BUILD_COMPILER = b.fmt("Zig {s} clang", .{builtin.zig_version_string}),
+            .BUILD_TARGET = b.fmt("{s}-{s}", .{
+                @tagName(self.target.result.cpu.arch),
+                @tagName(self.target.result.os.tag),
+            }),
+        }).getOutputFile();
 
-    const server_impl = blk: {
-        const mod = baseModule(b, cfg);
-        addCommonIncludes(cfg, mod);
-        mod.addIncludePath(cfg.src.path("tools/mtmd"));
-        mod.addIncludePath(cfg.src.path("tools/server"));
-        mod.addIncludePath(ui_include);
-        mod.addCSourceFiles(.{ .root = cfg.src.path(""), .files = &server_impl_sources, .flags = cfg.cxx });
-        mod.linkLibrary(server_context);
-        mod.linkLibrary(ui);
-        mod.linkLibrary(httplib);
-        break :blk addLibrary(b, cfg, "llama-server-impl", mod);
-    };
+        const common_base = blk: {
+            const mod = self.baseModule();
+            self.addCommonIncludes(mod);
+            mod.addCSourceFile(.{ .file = build_info, .flags = self.cxx });
+            break :blk self.addLibrary("llama-common-base", mod);
+        };
 
-    const cli_impl = blk: {
-        const mod = baseModule(b, cfg);
-        addCommonIncludes(cfg, mod);
-        mod.addIncludePath(cfg.src.path("tools/cli"));
-        mod.addIncludePath(cfg.src.path("tools/server"));
-        mod.addIncludePath(cfg.src.path("tools/mtmd"));
-        mod.addCSourceFiles(.{ .root = cfg.src.path(""), .files = &cli_impl_sources, .flags = cfg.cxx });
-        mod.linkLibrary(server_impl);
-        break :blk addLibrary(b, cfg, "llama-cli-impl", mod);
-    };
+        const common = blk: {
+            const mod = self.baseModule();
+            self.addCommonIncludes(mod);
+            mod.addIncludePath(self.src.path("tools/mtmd"));
+            mod.addCSourceFiles(.{ .root = self.src.path(""), .files = &common_sources, .flags = self.cxx });
+            mod.linkLibrary(common_base);
+            mod.linkLibrary(httplib);
+            mod.linkLibrary(llama);
+            mod.linkLibrary(ggml);
+            break :blk self.addLibrary("llama-common", mod);
+        };
 
-    const mod = baseModule(b, cfg);
-    addCommonIncludes(cfg, mod);
-    mod.addIncludePath(cfg.src.path("tools/cli"));
-    mod.addCSourceFiles(.{
-        .root = cfg.src.path(""),
-        .files = &[_][]const u8{"tools/cli/main.cpp"},
-        .flags = cfg.cxx,
-    });
-    mod.linkLibrary(cli_impl);
-    linkVulkan(b, cfg, mod);
+        // The web UI: upstream's bundle embedded under -Dui, else the stub.
+        const ui_headers = if (self.ui) |dist| try self.embedUi(dist) else null;
+        const ui_include = if (ui_headers) |h| h.dir else b.path("zig/ui-stub");
+        const ui = blk: {
+            const mod = self.baseModule();
+            mod.addIncludePath(ui_include);
+            if (ui_headers) |h| {
+                // tools/ui/CMakeLists.txt:63, add_library(llama-ui ui.cpp) with cxx_std_17.
+                mod.addCSourceFile(.{ .file = h.cpp, .flags = self.cxx_std });
+            } else {
+                mod.addCSourceFiles(.{
+                    .files = &[_][]const u8{"zig/ui-stub/ui.cpp"},
+                    .flags = self.cxx_std,
+                });
+            }
+            break :blk self.addLibrary("llama-ui", mod);
+        };
 
-    // tools/server/CMakeLists.txt:71, llama-server: main.cpp over llama-server-impl.
-    const server = blk: {
-        const smod = baseModule(b, cfg);
-        addCommonIncludes(cfg, smod);
-        smod.addIncludePath(cfg.src.path("tools/server"));
-        smod.addCSourceFiles(.{
-            .root = cfg.src.path(""),
-            .files = &[_][]const u8{"tools/server/main.cpp"},
-            .flags = cfg.cxx,
+        const server_context = blk: {
+            const mod = self.baseModule();
+            self.addCommonIncludes(mod);
+            mod.addIncludePath(self.src.path("tools/mtmd"));
+            mod.addIncludePath(self.src.path("tools/server"));
+            mod.addCSourceFiles(.{ .root = self.src.path(""), .files = &server_context_sources, .flags = self.cxx });
+            mod.linkLibrary(common);
+            mod.linkLibrary(mtmd);
+            break :blk self.addLibrary("server-context", mod);
+        };
+
+        const server_impl = blk: {
+            const mod = self.baseModule();
+            self.addCommonIncludes(mod);
+            mod.addIncludePath(self.src.path("tools/mtmd"));
+            mod.addIncludePath(self.src.path("tools/server"));
+            mod.addIncludePath(ui_include);
+            mod.addCSourceFiles(.{ .root = self.src.path(""), .files = &server_impl_sources, .flags = self.cxx });
+            mod.linkLibrary(server_context);
+            mod.linkLibrary(ui);
+            mod.linkLibrary(httplib);
+            break :blk self.addLibrary("llama-server-impl", mod);
+        };
+
+        const cli_impl = blk: {
+            const mod = self.baseModule();
+            self.addCommonIncludes(mod);
+            mod.addIncludePath(self.src.path("tools/cli"));
+            mod.addIncludePath(self.src.path("tools/server"));
+            mod.addIncludePath(self.src.path("tools/mtmd"));
+            mod.addCSourceFiles(.{ .root = self.src.path(""), .files = &cli_impl_sources, .flags = self.cxx });
+            mod.linkLibrary(server_impl);
+            break :blk self.addLibrary("llama-cli-impl", mod);
+        };
+
+        const mod = self.baseModule();
+        self.addCommonIncludes(mod);
+        mod.addIncludePath(self.src.path("tools/cli"));
+        mod.addCSourceFiles(.{
+            .root = self.src.path(""),
+            .files = &[_][]const u8{"tools/cli/main.cpp"},
+            .flags = self.cxx,
         });
-        smod.linkLibrary(server_impl);
-        linkVulkan(b, cfg, smod);
-        break :blk addExecutable(b, cfg, "llama-server", smod);
-    };
+        mod.linkLibrary(cli_impl);
+        self.linkVulkan(mod);
 
-    return .{ .cli = addExecutable(b, cfg, "llama-cli", mod), .server = server };
-}
+        // tools/server/CMakeLists.txt:71, llama-server: main.cpp over llama-server-impl.
+        const server = blk: {
+            const smod = self.baseModule();
+            self.addCommonIncludes(smod);
+            smod.addIncludePath(self.src.path("tools/server"));
+            smod.addCSourceFiles(.{
+                .root = self.src.path(""),
+                .files = &[_][]const u8{"tools/server/main.cpp"},
+                .flags = self.cxx,
+            });
+            smod.linkLibrary(server_impl);
+            self.linkVulkan(smod);
+            break :blk self.addExecutable("llama-server", smod);
+        };
 
-/// What `addCli` builds: the CLI, and the server over the same libraries.
-const Executables = struct {
-    cli: *std.Build.Step.Compile,
-    server: *std.Build.Step.Compile,
-};
-
-/// Links `libvulkan` into an executable when the Vulkan backend is on.
-fn linkVulkan(b: *std.Build, cfg: Config, mod: *std.Build.Module) void {
-    if (cfg.vulkan) |vk| {
-        for (vk.lib_dirs) |dir| mod.addLibraryPath(b.graph.cwdRelativePath(dir));
-        mod.linkSystemLibrary("vulkan", .{});
+        return .{ .cli = self.addExecutable("llama-cli", mod), .server = server };
     }
-}
 
-/// The generated `ui.h` and `ui.cpp`.
-const UiHeaders = struct {
-    /// The directory holding `ui.h`, for the include path.
-    dir: std.Build.LazyPath,
-    cpp: std.Build.LazyPath,
-};
-
-/// Embeds a built web UI, as `scripts/ui-assets.cmake`'s `emit_files` does.
-///
-/// Upstream's CMake first provisions the SvelteKit bundle -- `npm ci` and
-/// `npm run build` under `LLAMA_BUILD_UI`, or a download under
-/// `LLAMA_USE_PREBUILT_UI` -- then writes every file of it into
-/// `tools/ui/ui.h.in` and `ui.cpp.in` as byte arrays. The npm half is the
-/// Makefile's `ui` target here; `zig/ui_embed.zig` does the rest.
-///
-/// Parameters:
-/// - `b`: the build graph.
-/// - `cfg`: for `ui_gzip`.
-/// - `dist_path`: the bundle's directory, relative to the build root or
-///   absolute.
-///
-/// Return: the generated header directory and source; propagates
-/// directory-read failures.
-fn embedUi(b: *std.Build, cfg: Config, dist_path: []const u8) !UiHeaders {
-    const dist: std.Build.LazyPath = if (std.fs.path.isAbsolute(dist_path))
-        .{ .cwd_relative = dist_path }
-    else
-        b.path(dist_path);
-    const tool = b.addExecutable(.{
-        .name = "ui_embed",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("zig/ui_embed.zig"),
-            .target = b.graph.host,
-            // gzip and the hex dump of ~10 MB are slow in Debug.
-            .optimize = .ReleaseFast,
-        }),
-    });
-    const run = b.addRunArtifact(tool);
-    run.addDirectoryArg(dist);
-    run.addFileArg(cfg.src.path("tools/ui/ui.h.in"));
-    run.addFileArg(cfg.src.path("tools/ui/ui.cpp.in"));
-    run.addArg(if (cfg.ui_gzip) "1" else "0");
-    const h = run.addOutputFileArg("ui.h");
-    const cpp = run.addOutputFileArg("ui.cpp");
-
-    // A directory argument is not hashed by its contents: name every file,
-    // so a rebuilt bundle re-runs the tool. And reconfigure when any
-    // directory's listing changes (see appendGlob) -- every one, not just the
-    // top: each `npm run build` renames the hashed bundles under
-    // `_app/immutable/`, and a graph reused over the old listing fails on a
-    // file that no longer exists.
-    b.dependOnDirectoryContents(dist);
-    var handle = try b.root.openDir(b.graph.io, dist_path, .{ .iterate = true });
-    defer handle.close(b.graph.io);
-    var walker = try handle.walk(b.allocator);
-    defer walker.deinit();
-    while (try walker.next(b.graph.io)) |entry| {
-        const rel = b.dupe(entry.path);
-        if (entry.kind == .directory) {
-            b.dependOnDirectoryContents(dist.path(b, rel));
-            continue;
+    /// A module with the settings every C/C++ target in this build shares.
+    ///
+    /// - Returns: The module.
+    fn baseModule(self: *const Self) *std.Build.Module {
+        const b = self.b;
+        const mod = b.createModule(.{
+            .target = self.target,
+            .optimize = self.optimize,
+            .link_libc = true,
+            .link_libcpp = true,
+            // These sources are not UBSan-clean -- they rely on pointer arithmetic
+            // that is technically undefined but universally works -- and Zig turns
+            // the C sanitizers on in Debug. CMake never enabled them.
+            .sanitize_c = .off,
+        });
+        if (self.sdk) |sdk| {
+            mod.addFrameworkPath(b.graph.cwdRelativePath(b.fmt("{s}/System/Library/Frameworks", .{sdk})));
+            // Only iOS needs the library path spelled out; for macOS Zig already
+            // searches the SDK, and this is the same directory it would find.
+            mod.addLibraryPath(b.graph.cwdRelativePath(b.fmt("{s}/usr/lib", .{sdk})));
         }
-        run.addFileInput(dist.path(b, rel));
+        return mod;
     }
 
-    return .{ .dir = h.dirname(), .cpp = cpp };
-}
-
-/// Appends every file in `dir` with the given extension, as CMake's
-/// `file(GLOB)` does.
-///
-/// Parameters:
-/// - `b`: the build graph, for its allocator and IO.
-/// - `cfg`: for the sources' directory.
-/// - `files`: list to append source-relative paths to.
-/// - `dir`: directory to read, relative to the sources.
-/// - `ext`: extension to match, including the dot.
-///
-/// Return: nothing; propagates directory-read and allocation failures.
-fn appendGlob(b: *std.Build, cfg: Config, files: *std.ArrayList([]const u8), dir: []const u8, ext: []const u8) !void {
-    // `dir` is relative to the sources, and so are the paths appended, since
-    // the source lists are resolved against `cfg.src`.
-    //
-    // Zig 0.17 reuses a configured build graph until one of its declared
-    // inputs changes, and a directory listing is not one by default. A pinned
-    // package cannot change without its hash, but its unpacked copy under
-    // `zig-pkg/` is an ordinary directory, and an edit to it must reconfigure.
-    b.dependOnDirectoryContents(cfg.src.path(dir));
-    var handle = try cfg.src.builder.root.openDir(b.graph.io, dir, .{ .iterate = true });
-    defer handle.close(b.graph.io);
-
-    var it = handle.iterate();
-    while (try it.next(b.graph.io)) |entry| {
-        if (entry.kind != .file) continue;
-        if (!std.mem.endsWith(u8, entry.name, ext)) continue;
-        try files.append(b.allocator, b.fmt("{s}/{s}", .{ dir, entry.name }));
+    /// Wrap `b.addLibrary`, attaching the libc file when the platform needs one.
+    ///
+    /// `libc_file` lives on the compile step rather than the module, so it cannot
+    /// be set in `baseModule` and has to be applied at every construction site.
+    ///
+    /// - `name`: The library's name.
+    /// - `mod`: Its root module.
+    /// - Returns: The static library.
+    fn addLibrary(self: *const Self, name: []const u8, mod: *std.Build.Module) *std.Build.Step.Compile {
+        const b = self.b;
+        const lib = b.addLibrary(.{ .name = name, .root_module = mod, .linkage = .static });
+        lib.setLibCFile(self.libc_file);
+        return lib;
     }
+
+    /// Wrap `b.addExecutable`, attaching the libc file when the platform needs
+    /// one. See `addLibrary`.
+    ///
+    /// - `name`: The executable's name.
+    /// - `mod`: Its root module.
+    /// - Returns: The executable.
+    fn addExecutable(self: *const Self, name: []const u8, mod: *std.Build.Module) *std.Build.Step.Compile {
+        const b = self.b;
+        const exe = b.addExecutable(.{ .name = name, .root_module = mod });
+        exe.setLibCFile(self.libc_file);
+        return exe;
+    }
+
+    /// Add the include paths shared by everything above ggml.
+    ///
+    /// - `mod`: The module that gains them.
+    fn addCommonIncludes(self: *const Self, mod: *std.Build.Module) void {
+        mod.addIncludePath(self.src.path(""));
+        mod.addIncludePath(self.src.path("include"));
+        // Note `src` is deliberately absent. It holds a second unicode.h, and
+        // adding it here shadows common/unicode.h, which common/jinja needs.
+        // CMake keeps it PRIVATE to the llama target for the same reason.
+        mod.addIncludePath(self.src.path("common"));
+        mod.addIncludePath(self.src.path("ggml/include"));
+        mod.addIncludePath(self.src.path("ggml/src"));
+        // Covers both <nlohmann/json.hpp> and <cpp-httplib/httplib.h>.
+        mod.addIncludePath(self.src.path("vendor"));
+    }
+
+    /// Add ggml's Vulkan backend to `mod`: the shader generator, the SPIR-V it
+    /// embeds, and `ggml-vulkan.cpp`. `addCli` links `libvulkan`.
+    ///
+    /// Replaces CMake's `ExternalProject` and custom commands
+    /// (`ggml-vulkan/CMakeLists.txt:162-259`) with the same two passes of the
+    /// same tool. `vulkan-shaders-gen` is upstream's generator, built for the host
+    /// with the extension macros: run once with no source it writes
+    /// `ggml-vulkan-shaders.hpp`, declaring every variant; run once per `.comp`
+    /// with `--glslc` it compiles that file's variants and writes a `.cpp`
+    /// holding their SPIR-V. Each run is a separate, cached step, so the 155
+    /// shader files compile in parallel and only a changed one recompiles.
+    ///
+    /// Every `.comp` and `.glsl` is an input of every run: a shader's includes
+    /// are resolved by `glslc`, which Zig cannot see.
+    ///
+    /// - `vk`: What `configureVulkan` resolved.
+    /// - `mod`: ggml's module, which gains the backend's sources.
+    /// - Returns: Nothing; propagates directory-read failures.
+    fn addVulkan(self: *const Self, vk: Vulkan, mod: *std.Build.Module) !void {
+        const b = self.b;
+        const gen_mod = b.createModule(.{
+            .target = b.graph.host,
+            .optimize = .fast,
+            .link_libc = true,
+            .link_libcpp = true,
+            .sanitize_c = .off,
+        });
+        gen_mod.addCSourceFile(.{
+            .file = self.src.path(vulkan_shaders_dir ++ "/vulkan-shaders-gen.cpp"),
+            .flags = try join(b, &cxx_std, vk.features),
+        });
+        const gen = b.addExecutable(.{ .name = "vulkan-shaders-gen", .root_module = gen_mod });
+
+        var comp: std.ArrayList([]const u8) = .empty;
+        try self.appendGlob(&comp, vulkan_shaders_dir, ".comp");
+        var glsl: std.ArrayList([]const u8) = .empty;
+        try self.appendGlob(&glsl, vulkan_shaders_dir, ".glsl");
+
+        // Pass 1: the header, which names every variant.
+        const hdr_run = b.addRunArtifact(gen);
+        hdr_run.addArg("--output-dir");
+        _ = hdr_run.addOutputDirectoryArg2("spv", .{});
+        hdr_run.addArg("--target-hpp");
+        const header = hdr_run.addOutputFileArg2("ggml-vulkan-shaders.hpp", .{});
+        mod.addIncludePath(header.dirname());
+
+        // `-idirafter`, not `-I`: the header directory is usually `/usr/include`,
+        // which must not shadow the libc headers Zig supplies.
+        var vk_flags: std.ArrayList([]const u8) = .empty;
+        try vk_flags.appendSlice(b.allocator, self.cxx);
+        try vk_flags.appendSlice(b.allocator, vk.features);
+        for (vk.include_dirs) |dir| try vk_flags.appendSlice(b.allocator, &.{ "-idirafter", dir });
+        // `CXX_VISIBILITY_PRESET hidden` and `VISIBILITY_INLINES_HIDDEN ON`
+        // (ggml-vulkan/CMakeLists.txt:74-76, since v0.5.0), so a dlclosed duplicate
+        // copy cannot interpose the backend's symbols.
+        try vk_flags.appendSlice(b.allocator, &.{ "-fvisibility=hidden", "-fvisibility-inlines-hidden" });
+
+        // Pass 2: one run per shader file, each writing that file's SPIR-V.
+        for (comp.items) |file| {
+            const run = b.addRunArtifact(gen);
+            run.addArgs(&.{ "--glslc", vk.glslc });
+            run.addArg("--source");
+            run.addFileArg(self.src.path(file));
+            run.addArg("--output-dir");
+            _ = run.addOutputDirectoryArg2("spv", .{});
+            // Only its basename is used, for the generated `#include`.
+            run.addArgs(&.{ "--target-hpp", "ggml-vulkan-shaders.hpp" });
+            run.addArg("--target-cpp");
+            const cpp = run.addOutputFileArg2(b.fmt("{s}.cpp", .{std.Io.Dir.path.basename(file)}), .{});
+            for (comp.items) |f| run.addFileInput(self.src.path(f));
+            for (glsl.items) |f| run.addFileInput(self.src.path(f));
+            mod.addCSourceFile(.{ .file = cpp, .flags = self.cxx });
+        }
+
+        mod.addCSourceFiles(.{
+            .root = self.src.path(""),
+            .files = &.{
+                "ggml/src/ggml-vulkan/ggml-vulkan.cpp",
+                "ggml/src/ggml-vulkan/ggml-vulkan-buffers.cpp",
+                "ggml/src/ggml-vulkan/ggml-vulkan-comm.cpp",
+                "ggml/src/ggml-vulkan/ggml-vulkan-debug.cpp",
+            },
+            .flags = vk_flags.items,
+        });
+        // `libvulkan` is linked by the executable, in `addCli`, not here: Zig
+        // resolves a system library even for a static archive, which links
+        // nothing, and a machine that only builds the archive -- for a harness
+        // that links it itself -- need not have the loader installed.
+    }
+
+    /// Flatten one Metal kernel and return the assembly stub that embeds it.
+    ///
+    /// Replaces the `cat`/`sed` pipeline CMake runs under
+    /// `GGML_METAL_EMBED_LIBRARY`. The stub `.incbin`s the flattened shader
+    /// *source* into a `__DATA,__ggml_metallib` section; the Metal driver compiles
+    /// it at load time, so no `xcrun metal` step is involved. That is also why
+    /// this works unchanged for iOS: nothing here is host-specific.
+    ///
+    /// Never switch to the non-embedded path: that one does need `xcrun metal`,
+    /// which the Zig toolchain cannot replace.
+    ///
+    /// - `tool`: `zig/metal_embed.zig`, built for the host.
+    /// - `kind`: The kernel, one of `metal_kernels`.
+    /// - Returns: The generated assembly stub.
+    fn embedMetalKernel(self: *const Self, tool: *std.Build.Step.Compile, kind: []const u8) std.Build.LazyPath {
+        const b = self.b;
+        const run = b.addRunArtifact(tool);
+        run.addArg(kind);
+        _ = run.addOutputFileArg2(b.fmt("ggml-metal-embed-{s}.metal", .{kind}), .{});
+        const out_asm = run.addOutputFileArg2(b.fmt("ggml-metal-embed-{s}.s", .{kind}), .{});
+
+        run.addFileArg(self.src.path("ggml/src/ggml-common.h"));
+        run.addFileArg(self.src.path("ggml/src/ggml-metal/ggml-metal-impl.h"));
+        run.addFileArg(self.src.path("ggml/src/ggml-metal/kernels/common.h"));
+        run.addFileArg(self.src.path("ggml/src/ggml-metal/kernels/dequantize.h"));
+        run.addFileArg(self.src.path("ggml/src/ggml-metal/kernels/quantize.h"));
+        run.addFileArg(self.src.path("ggml/src/ggml-metal/kernels/fa_common.metal"));
+        run.addFileArg(self.src.path("ggml/src/ggml-metal/kernels/fa_vec_common.metal"));
+        run.addFileArg(self.src.path(b.fmt("ggml/src/ggml-metal/kernels/{s}.metal", .{kind})));
+
+        return out_asm;
+    }
+
+    /// Link `libvulkan` into an executable when the Vulkan backend is on.
+    ///
+    /// - `mod`: The executable's root module.
+    fn linkVulkan(self: *const Self, mod: *std.Build.Module) void {
+        const b = self.b;
+        if (self.vulkan) |vk| {
+            for (vk.lib_dirs) |dir| mod.addLibraryPath(b.graph.cwdRelativePath(dir));
+            mod.linkSystemLibrary("vulkan", .{});
+        }
+    }
+
+    /// Embed a built web UI, as `scripts/ui-assets.cmake`'s `emit_files` does.
+    ///
+    /// Upstream's CMake first provisions the SvelteKit bundle -- `npm ci` and
+    /// `npm run build` under `LLAMA_BUILD_UI`, or a download under
+    /// `LLAMA_USE_PREBUILT_UI` -- then writes every file of it into
+    /// `tools/ui/ui.h.in` and `ui.cpp.in` as byte arrays. The npm half is the
+    /// Makefile's `ui` target here; `zig/ui_embed.zig` does the rest.
+    ///
+    /// - `dist_path`: The bundle's directory, relative to the build root or
+    ///   absolute.
+    /// - Returns: The generated header directory and source; propagates
+    ///   directory-read failures.
+    fn embedUi(self: *const Self, dist_path: []const u8) !UiHeaders {
+        const b = self.b;
+        const dist: std.Build.LazyPath = if (std.Io.Dir.path.isAbsolute(dist_path))
+            b.graph.cwdRelativePath(dist_path)
+        else
+            b.path(dist_path);
+        const tool = b.addExecutable(.{
+            .name = "ui_embed",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("zig/ui_embed.zig"),
+                .target = b.graph.host,
+                // gzip and the hex dump of ~10 MB are slow in Debug.
+                .optimize = .fast,
+            }),
+        });
+        const run = b.addRunArtifact(tool);
+        run.addDirectoryArg2(dist, .{});
+        run.addFileArg(self.src.path("tools/ui/ui.h.in"));
+        run.addFileArg(self.src.path("tools/ui/ui.cpp.in"));
+        run.addArg(if (self.ui_gzip) "1" else "0");
+        const h = run.addOutputFileArg2("ui.h", .{});
+        const cpp = run.addOutputFileArg2("ui.cpp", .{});
+
+        // A directory argument is not hashed by its contents: name every file,
+        // so a rebuilt bundle re-runs the tool. And reconfigure when any
+        // directory's listing changes (see appendGlob) -- every one, not just the
+        // top: each `npm run build` renames the hashed bundles under
+        // `_app/immutable/`, and a graph reused over the old listing fails on a
+        // file that no longer exists.
+        b.dependOnDirectoryContents(dist);
+        var handle = try b.root.openDir(b.graph.io, dist_path, .{ .iterate = true });
+        defer handle.close(b.graph.io);
+        var walker = try handle.walk(b.allocator);
+        defer walker.deinit();
+        while (try walker.next(b.graph.io)) |entry| {
+            const rel = b.graph.dupeString(entry.path);
+            if (entry.kind == .directory) {
+                b.dependOnDirectoryContents(dist.path(b, rel));
+                continue;
+            }
+            run.addFileInput(dist.path(b, rel));
+        }
+
+        return .{ .dir = h.dirname(), .cpp = cpp };
+    }
+
+    /// Append every file in `dir` with the given extension, as CMake's
+    /// `file(GLOB)` does.
+    ///
+    /// - `files`: The list source-relative paths are appended to.
+    /// - `dir`: The directory to read, relative to the sources.
+    /// - `ext`: The extension to match, including the dot.
+    /// - Returns: Nothing; propagates directory-read and allocation failures.
+    fn appendGlob(self: *const Self, files: *std.ArrayList([]const u8), dir: []const u8, ext: []const u8) !void {
+        const b = self.b;
+        // `dir` is relative to the sources, and so are the paths appended, since
+        // the source lists are resolved against `self.src`.
+        //
+        // Zig 0.17 reuses a configured build graph until one of its declared
+        // inputs changes, and a directory listing is not one by default. A pinned
+        // package cannot change without its hash, but its unpacked copy under
+        // `zig-pkg/` is an ordinary directory, and an edit to it must reconfigure.
+        b.dependOnDirectoryContents(self.src.path(dir));
+        var handle = try self.src.builder.root.openDir(b.graph.io, dir, .{ .iterate = true });
+        defer handle.close(b.graph.io);
+
+        var it = handle.iterate();
+        while (try it.next(b.graph.io)) |entry| {
+            if (entry.kind != .file) continue;
+            if (!std.mem.endsWith(u8, entry.name, ext)) continue;
+            try files.append(b.allocator, b.fmt("{s}/{s}", .{ dir, entry.name }));
+        }
+    }
+
+    /// Concatenate two flag lists into one the build graph can hold onto.
+    ///
+    /// - `b`: The build graph, whose allocator owns the result.
+    /// - `a`: The leading flags.
+    /// - `c`: The trailing flags.
+    /// - Returns: The joined list.
+    fn join(b: *std.Build, a: []const []const u8, c: []const []const u8) ![]const []const u8 {
+        const out = try b.allocator.alloc([]const u8, a.len + c.len);
+        @memcpy(out[0..a.len], a);
+        @memcpy(out[a.len..], c);
+        return out;
+    }
+
+    /// Locate the Apple SDK matching the target, for the header, framework, and
+    /// library search paths.
+    ///
+    /// - `b`: The build graph, for its allocator and I/O.
+    /// - `target`: The resolved target; selects the SDK by OS and ABI.
+    /// - Returns: The SDK path; `error.AppleSdkNotFound` when none is installed.
+    fn resolveAppleSdk(b: *std.Build, target: std.Target) ![]const u8 {
+        return std.zig.system.darwin.getSdk(b.allocator, b.graph.io, &target) orelse
+            error.AppleSdkNotFound;
+    }
+
+    /// Write a `zig libc` file describing an Apple SDK.
+    ///
+    /// Pointing both include directories at the SDK fixes the compile and, because
+    /// Zig feeds the same file to its internal libc++ build, the link as well. See
+    /// `libc_file` for why a named triple needs this and a native one does not.
+    ///
+    /// Zig 0.17 requires two keys it did not before: `darwin_sdk_dir`, the SDK
+    /// root, and a non-empty `crt_dir`. Both take the values Zig's own native
+    /// detection writes (`LibCInstallation.findNative`), so a named triple sees the
+    /// same libc a native build does. The remaining keys are required by the file
+    /// format and empty by design: the MSVC and cc keys are for other platforms
+    /// entirely.
+    ///
+    /// - `b`: The build graph, for its allocator and generated-file step.
+    /// - `sdk`: The SDK root.
+    /// - Returns: A lazy path to the generated file, valid for the whole build.
+    fn writeAppleLibcFile(b: *std.Build, sdk: []const u8) std.Build.LazyPath {
+        return b.addWriteFiles().add("apple-libc.txt", b.fmt(
+            \\include_dir={s}/usr/include
+            \\sys_include_dir={s}/usr/include
+            \\crt_dir={s}/usr/lib
+            \\msvc_lib_dir=
+            \\kernel32_lib_dir=
+            \\cc_dir=
+            \\darwin_sdk_dir={s}
+            \\
+        , .{ sdk, sdk, sdk, sdk }));
+    }
+
+    /// Read the `-Dvulkan` options and ask `glslc` which shader extensions it
+    /// accepts, at configure time, as `ggml-vulkan/CMakeLists.txt:34-57` does.
+    ///
+    /// CMake's test is the one reproduced: an extension is supported unless
+    /// `glslc`'s diagnostics contain `extension not supported: <name>` -- any
+    /// other failure still counts as support. Locating `glslc` poisons Zig's
+    /// configuration cache, so every build re-asks, and a `glslc` that changes
+    /// between builds cannot leave stale answers.
+    ///
+    /// - `b`: The build graph, for its options, allocator and process spawning.
+    /// - `platform`: Decides the default header directory.
+    /// - `src`: The llama.cpp sources, for the feature-test shaders.
+    /// - Returns: Null without `-Dvulkan`; otherwise the configuration, or an
+    ///   error when `glslc` or the headers cannot be found or a probe cannot run.
+    fn configureVulkan(b: *std.Build, platform: Platform, src: *std.Build.Dependency) !?Vulkan {
+        const enabled = b.option(bool, "vulkan", "Build ggml's Vulkan backend (needs glslc, the Vulkan and SPIR-V headers, and libvulkan)") orelse false;
+        const glslc_opt = b.option([]const u8, "glslc", "The glslc to compile the Vulkan shaders with (default: glslc on PATH)");
+        const include_opt = b.option([]const []const u8, "vulkan-include", "Directories holding vulkan/ and spirv/, searched after libc's headers (default on Linux: /usr/include)");
+        const lib_opt = b.option([]const []const u8, "vulkan-lib", "Extra directories to find libvulkan in");
+        if (!enabled) return null;
+
+        const glslc = glslc_opt orelse b.findProgram(.{ .names = &.{"glslc"} }) orelse {
+            log.err("-Dvulkan needs glslc: put it on PATH or pass -Dglslc=<path>", .{});
+            return error.GlslcNotFound;
+        };
+        const include_dirs: []const []const u8 = include_opt orelse if (platform == .linux)
+            &.{"/usr/include"}
+        else {
+            log.err("-Dvulkan on {s} needs -Dvulkan-include=<dir holding vulkan/ and spirv/>", .{@tagName(platform)});
+            return error.VulkanHeadersNotFound;
+        };
+
+        // The probes below count any output but a refusal as support, so a
+        // `glslc` that cannot run at all would pass every one of them: make sure
+        // it runs first.
+        switch (b.runFallible(&.{ glslc, "--version" }, .{ .stderr_behavior = .ignore })) {
+            .success => {},
+            else => {
+                log.err("-Dvulkan: {s} does not run", .{glslc});
+                return error.GlslcNotFound;
+            },
+        }
+
+        var features: std.ArrayList([]const u8) = .empty;
+        for (vulkan_features) |f| {
+            const rel = b.fmt("{s}/feature-tests/{s}", .{ vulkan_shaders_dir, f.test_shader });
+            b.dependOnFileContents(src.path(rel));
+            const test_shader = try src.builder.root.joinString(b.allocator, rel);
+            // glslc's diagnostics go to stderr and it exits non-zero on the
+            // refusal, so the shell folds both into a successful stdout.
+            const out = switch (b.runFallible(&.{
+                "sh",                                                                                       "-c",
+                "\"$0\" -o - -fshader-stage=compute --target-env=vulkan1.3 \"$1\" 2>&1 >/dev/null; exit 0", glslc,
+                test_shader,
+            }, .{ .stderr_behavior = .ignore })) {
+                .success => |stdout| stdout,
+                else => {
+                    log.err("could not run {s} on {s}", .{ glslc, test_shader });
+                    return error.GlslcProbeFailed;
+                },
+            };
+            const refusal = b.fmt("extension not supported: {s}", .{f.extension});
+            if (std.mem.find(u8, out, refusal) == null) {
+                try features.append(b.allocator, b.fmt("-D{s}", .{f.define}));
+            }
+        }
+
+        return .{
+            .glslc = glslc,
+            .include_dirs = include_dirs,
+            .lib_dirs = lib_opt orelse &.{},
+            .features = features.items,
+        };
+    }
+};
+
+/// Declare the build graph.
+///
+/// - `b`: The build graph the steps are registered on.
+/// - Returns: Nothing on success; propagates target, SDK resolution, and
+///   directory-read failures.
+pub fn build(b: *std.Build) !void {
+    const cfg = try Config.init(b);
+
+    const ggml = try cfg.addGgml();
+    const llama = try cfg.addLlama(ggml);
+
+    const lib_step = b.step("lib", "Build ggml and libllama only");
+    lib_step.dependOn(&b.addInstallArtifact(ggml, .{}).step);
+    lib_step.dependOn(&b.addInstallArtifact(llama, .{}).step);
+
+    const hash = cfg.addVendorHash();
+    const mtmd = try cfg.addMtmd(ggml, llama, hash);
+
+    // One slice of upstream's llama.xcframework: what `combine_static_libraries`
+    // (build-xcframework.sh) force-loads into the framework's binary, less
+    // ggml's internal split (see addGgml). The Makefile's `xcframework` target
+    // links and bundles it, and builds its C++ runtime probe against the libc
+    // file installed beside the libraries -- the one they were compiled with.
+    const xcf_step = b.step("xcframework", "Build one llama.xcframework slice's libraries (ggml with BLAS, llama, mtmd, vendor-hash) for an Apple -Dtarget; needs -Dblas");
+    if (!cfg.platform.isApple()) {
+        xcf_step.dependOn(&b.addFail("xcframework: the target is not an Apple platform").step);
+    } else if (!cfg.blas) {
+        xcf_step.dependOn(&b.addFail("xcframework: upstream's Apple framework has the BLAS backend; pass -Dblas").step);
+    } else {
+        for ([_]*std.Build.Step.Compile{ ggml, llama, mtmd, hash }) |lib| {
+            xcf_step.dependOn(&b.addInstallArtifact(lib, .{}).step);
+        }
+        xcf_step.dependOn(&b.addInstallFile(cfg.libc_file.?, "apple-libc.txt").step);
+    }
+
+    const exes = try cfg.addCli(ggml, llama, mtmd);
+    const cli = exes.cli;
+    b.installArtifact(cli);
+
+    const cli_step = b.step("cli", "Build llama-cli");
+    cli_step.dependOn(&b.addInstallArtifact(cli, .{}).step);
+
+    // Not part of the default step: llama-cli is this build's deliverable.
+    const server_step = b.step("server", "Build llama-server (with the web UI under -Dui)");
+    server_step.dependOn(&b.addInstallArtifact(exes.server, .{}).step);
+
+    const run = b.addRunArtifact(cli);
+    run.step.dependOn(b.getInstallStep());
+    run.addPassthruArgs();
+    const run_step = b.step("run", "Run llama-cli");
+    run_step.dependOn(&run.step);
 }

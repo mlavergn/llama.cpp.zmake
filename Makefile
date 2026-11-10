@@ -12,7 +12,7 @@
 
 .DEFAULT_GOAL := build
 
-.PHONY: fetch pin srcdir build dist lib cli run clean distclean macos ios linux linux-x86_64 windows-x86_64 ui server web
+.PHONY: fetch pin srcdir build dist lib cli run clean distclean macos ios linux linux-x86_64 windows-x86_64 xcframework ui server web ref verify
 
 # Pinned deliberately. A port against a moving target does not converge.
 #
@@ -31,10 +31,9 @@ LLAMA_CPP_DIR := zig-pkg/$(shell sed -n 's/^ *\.hash = "\(.*\)",$$/\1/p' build.z
 # feature-test macros -- from the triple, so these are the only knob the
 # platform targets turn.
 #
-# Both Apple deployment targets are 26.0. Naming an older one is not free: at
-# 13.0 the Xcode 26 SDK fails the build outright, because Accelerate's Sparse
-# headers annotate symbols as macOS 15.5+ and clang makes unguarded use of them
-# an error rather than a warning.
+# Both Apple deployment targets are 26.0, the floor this project needs. Lower
+# ones build -- llama-cli compiles and links at macOS 13.0 and 13.3 under
+# Zig 0.17 -- but nothing has been run there.
 MACOS_TARGET ?= aarch64-macos.26.0
 IOS_TARGET   ?= aarch64-ios.26.0
 LINUX_TARGET ?= aarch64-linux-gnu
@@ -157,6 +156,15 @@ linux-x86_64:
 windows-x86_64:
 	zig build cli $(RELEASE) -Dtarget=$(WINDOWS_X86_TARGET) -Dcpu=$(X86_CPU) -p zig-out/windows-x86_64 $(VULKAN_FLAGS)
 
+# llama.xcframework from the stock sources: upstream's seven slices and
+# bundle layout, the libraries built by build.zig, minimum OS 26.0. The same
+# shape as llamazig's xcframework/, for comparing the two. Everything is in
+# zig/xcframework/xcframework.mk; one slice is e.g.
+#   make xcframework XCF_BUILDS=macos
+# -> zig-out/xcframework/llama.xcframework
+xcframework: fetch
+	$(MAKE) -f zig/xcframework/xcframework.mk LLAMA_CPP_DIR=$(LLAMA_CPP_DIR)
+
 # The web UI. upstream's CMake (scripts/ui-assets.cmake, LLAMA_BUILD_UI)
 # copies tools/ui to its build tree, runs `npm ci` and `npm run build` there
 # with the output directory and build number in the environment, then embeds
@@ -193,6 +201,40 @@ web: ui server
 	     kill -0 $$$$ 2>/dev/null || exit 0; sleep 0.5; \
 	   done ) & \
 	exec ./zig-out/bin/llama-server -m $(MODEL) --port $(PORT) $(ARGS)
+
+# The CMake reference: llama-cli built by upstream's CMake from the same
+# pinned sources, configured as CLAUDE.md's "How to verify a change" gives it
+# for macOS. Needs cmake (CMAKE=<path> for one not on PATH). Its banner's
+# build number and commit come from this repository's git, which CMake finds
+# above zig-pkg/; verify ignores that line.
+REF_DIR ?= .ref
+CMAKE   ?= cmake
+# A bounded -j: CMake's Makefiles have hundreds of independent compiles, and a
+# bare -j starts them all at once.
+JOBS    ?= $(shell sysctl -n hw.logicalcpu 2>/dev/null || nproc 2>/dev/null || echo 4)
+
+ref: fetch
+	@test "$$(uname -s)" = Darwin || { echo "make ref: this is the macOS reference (Metal, Accelerate); see CLAUDE.md for other platforms"; exit 1; }
+	mkdir -p $(REF_DIR)
+	cd $(REF_DIR) && "$(CMAKE)" "$(abspath $(LLAMA_CPP_DIR))" -G "Unix Makefiles" \
+	  -DCMAKE_SYSTEM_NAME=Darwin -DCMAKE_OSX_SYSROOT=macosx \
+	  -DCMAKE_OSX_ARCHITECTURES=arm64 -DCMAKE_OSX_DEPLOYMENT_TARGET=13.0 \
+	  -DCMAKE_BUILD_TYPE=Release -DGGML_METAL=ON -DGGML_METAL_EMBED_LIBRARY=ON \
+	  -DGGML_ACCELERATE=ON -DGGML_BLAS=OFF -DGGML_OPENMP=OFF -DGGML_NATIVE=OFF \
+	  -DBUILD_SHARED_LIBS=OFF -DLLAMA_CURL=OFF
+	$(MAKE) -C $(REF_DIR) -j$(JOBS) llama-cli
+
+# Diff the tokens llama-cli generates against a reference build of the same
+# sources (zig/verify.sh): greedy, fixed seed, three prompts, each on the GPU
+# and the CPU by default (VERIFY_NGL). Fails on any difference, any non-zero
+# exit, and any run that generated nothing. REF defaults to `make ref`'s.
+REF        ?= $(REF_DIR)/bin/llama-cli
+VERIFY_NGL ?= 99 0
+
+verify:
+	@test -x "$(REF)" || { echo "make verify: no reference llama-cli at $(REF); run 'make ref', or pass REF=<binary>"; exit 1; }
+	zig build cli $(RELEASE) $(VULKAN_FLAGS)
+	zig/verify.sh "$(REF)" zig-out/bin/llama-cli "$(MODEL)" $(VERIFY_NGL)
 
 # Run llama-cli. Pass arguments with ARGS, e.g.
 #   make run ARGS="-m model.gguf -p 'hello' -ngl 99"
