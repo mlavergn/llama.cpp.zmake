@@ -12,7 +12,7 @@
 
 .DEFAULT_GOAL := build
 
-.PHONY: fetch pin srcdir build dist lib cli run clean distclean macos ios linux linux-x86_64 windows-x86_64 xcframework ui server web ref verify
+.PHONY: fetch pin srcdir build dist lib cli run clean distclean macos ios linux linux-x86_64 windows-x86_64 cuda xcframework ui server web ref verify
 
 # Pinned deliberately. A port against a moving target does not converge.
 #
@@ -155,6 +155,23 @@ linux-x86_64:
 # same arch/x86 sources and X86_CPU as Linux; CPU backend only.
 windows-x86_64:
 	zig build cli $(RELEASE) -Dtarget=$(WINDOWS_X86_TARGET) -Dcpu=$(X86_CPU) -p zig-out/windows-x86_64 $(VULKAN_FLAGS)
+
+# CUDA: llama-cli with ggml's CUDA backend, for this machine (Linux, the
+# host's architecture). The .cu files are compiled by the toolkit's nvcc with
+# its default host compiler, g++, exactly as CMake compiles them -- the
+# objects match a CMake build's byte for byte -- and the rest by Zig as
+# usual. Needs the CUDA toolkit (CUDA_PATH=<dir>, default /usr/local/cuda)
+# and g++.
+#
+# CUDA_ARCH picks the GPU architectures, in CMAKE_CUDA_ARCHITECTURES
+# spelling. It defaults to 121a-real, the GB10 alone, because CMake's
+# non-native default compiles every file for seven architectures; pass
+# CUDA_ARCH= for that list, or e.g. CUDA_ARCH="86-real 89-real".
+CUDA_ARCH ?= 121a-real
+CUDA_FLAGS = -Dcuda $(foreach a,$(CUDA_ARCH),-Dcuda-arch=$(a)) $(if $(CUDA_PATH),-Dcuda-path=$(CUDA_PATH))
+
+cuda:
+	zig build cli $(RELEASE) $(CUDA_FLAGS) -p zig-out/cuda $(VULKAN_FLAGS)
 
 # llama.xcframework from the stock sources: upstream's seven slices and
 # bundle layout, the libraries built by build.zig, minimum OS 26.0. The same

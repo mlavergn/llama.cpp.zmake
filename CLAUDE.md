@@ -64,6 +64,7 @@ make macos     # llama-cli, arm64, optimized -> zig-out/macos/bin/
 make ios       #                             -> zig-out/ios/bin/
 make linux     #                             -> zig-out/linux/bin/
 make linux-x86_64 # x86_64, AVX2 by default     -> zig-out/linux-x86_64/bin/
+make cuda      # llama-cli with CUDA, this Linux host -> zig-out/cuda/bin/
 
 make xcframework  # upstream's 7 Apple slices -> zig-out/xcframework/llama.xcframework
 ```
@@ -119,6 +120,25 @@ no optional extension, 1,541 with all of them (counted at v0.5.0). Those answers
 version decide which C++ compiles, so two builds compared on bits must use
 the same `glslc` and headers. Added for llamazig's Vulkan port under an
 explicit grant.
+
+**CUDA, optional:** `-Dcuda` (`make cuda`) adds ggml's CUDA backend on Linux,
+for the host's own architecture. The 147 `.cu` files are compiled by the
+toolkit's `nvcc` with its default host compiler, g++ -- CMake's exact command
+lines, including its unnormalized include spellings, so the objects match a
+CMake build's byte for byte except nvcc's `tmpxft_<pid>` temp name in one
+local symbol. Zig's clang cannot be nvcc's host: CUDA 13.0's
+`math_functions.hpp` clashes with libc++ 22's `isnan`/`isinf`. So the
+executables link `libstdc++.so` and `libgcc.a` (g++'s arm64 outline atomics)
+by path, beside the shared `cudart`, `cublas`, `cublasLt`, static `culibos`
+and the `libcuda` stub, with an rpath to the toolkit, as CMake's link line
+has. `-Dcuda-path` (default `$CUDA_PATH`, else `/usr/local/cuda`),
+`-Dcuda-arch` (CMake's `CMAKE_CUDA_ARCHITECTURES` spelling; default its
+non-native list, `make cuda` passes `121a-real` for the GB10) and
+`-Dcuda-fa-quants` (`GGML_CUDA_FA_QUANTS`). Verified on the GB10 (CUDA 13.0)
+against `cmake -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=121a-real`:
+token-identical at `-ngl 99`, 3 of 3. `-ngl 0` exercises the Linux CPU
+path, which is gcc in CMake and Zig's clang here, and is not verified.
+Added under an explicit grant.
 
 | | Metal | Accelerate | subprocess | target |
 |--------|-------|------------|------------|--------|

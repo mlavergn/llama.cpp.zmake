@@ -44,6 +44,13 @@
 //! Which shader extensions that `glslc` accepts decides which C++ compiles, so
 //! the same `glslc` and headers must build both sides of any comparison.
 //!
+//! `-Dcuda` adds ggml's CUDA backend, on Linux for the host's own
+//! architecture. Its `.cu` files are compiled by the toolkit's `nvcc` with
+//! nvcc's default host compiler (g++), exactly as CMake's `enable_language(CUDA)`
+//! compiles them; everything else stays on Zig's clang. `-Dcuda-path` names the
+//! toolkit (default `$CUDA_PATH`, else `/usr/local/cuda`), `-Dcuda-arch` the
+//! GPU architectures in CMake's `CMAKE_CUDA_ARCHITECTURES` spelling.
+//!
 //! # Steps
 //!
 //!   zig build            everything below
@@ -457,6 +464,41 @@ const Vulkan = struct {
     features: []const []const u8,
 };
 
+/// The CUDA backend's sources, relative to the sources.
+const cuda_dir = "ggml/src/ggml-cuda";
+
+/// The FlashAttention K/V types `ggml_cuda_fattn_vec_instances` knows
+/// (`ggml/cmake/common.cmake:61`), in its order.
+const cuda_fa_types = [_][]const u8{ "q4_0", "q4_1", "q5_0", "q5_1", "q8_0", "bf16", "f16" };
+
+/// `GGML_CUDA_FA_QUANTS`'s default (`ggml/CMakeLists.txt:208`), with the
+/// commas CMake's define joins it with.
+const cuda_fa_quants_default = "q4_0-q4_0,q8_0-q8_0,f16-f16,bf16-bf16";
+
+/// What `-Dcuda` resolved to at configure time.
+const Cuda = struct {
+    const Self = @This();
+    /// The `nvcc` every `.cu` file is compiled with.
+    nvcc: []const u8,
+    /// The toolkit's libraries: cudart, cublas, cublasLt and culibos.
+    lib_dir: []const u8,
+    /// The toolkit's driver stubs, which hold the `libcuda.so` linked against.
+    stubs_dir: []const u8,
+    /// The host compiler's `libstdc++.so`, which the `.cu` objects' host code
+    /// calls into.
+    libstdcxx: []const u8,
+    /// The host compiler's `libgcc.a`, for the outline atomics
+    /// (`__aarch64_cas4_sync` and kin) g++ emits on arm64 by default, which
+    /// Zig's compiler_rt does not provide in their `_sync` form.
+    libgcc: []const u8,
+    /// Every `nvcc` flag but the include paths and the file's own arguments:
+    /// the defines, then `CUDA_FLAGS`, in CMake's order.
+    flags: []const []const u8,
+    /// The `.cu` files under `fattn-vec-instance-*` that the selected
+    /// FlashAttention K/V combinations compile.
+    fa_vec_sources: []const []const u8,
+};
+
 /// The generated `ui.h` and `ui.cpp`.
 const UiHeaders = struct {
     const Self = @This();
@@ -532,6 +574,9 @@ const Config = struct {
     /// The Vulkan backend's configuration; null without `-Dvulkan`.
     vulkan: ?Vulkan = null,
 
+    /// The CUDA backend's configuration; null without `-Dcuda`.
+    cuda: ?Cuda = null,
+
     /// The built web UI to embed (`-Dui`, a SvelteKit `dist` directory,
     /// relative to the build root or absolute); null for `zig/ui-stub`'s
     /// empty table.
@@ -584,6 +629,7 @@ const Config = struct {
         const src = b.dependency(src_dep, .{});
         const sdk = if (platform.isApple()) try resolveAppleSdk(b, target.result) else null;
         const vulkan = try configureVulkan(b, platform, src);
+        const cuda = try configureCuda(b, platform, target.result, optimize);
         const blas = b.option(bool, "blas", "Build ggml's BLAS backend over Accelerate, as upstream's Apple builds do by default (Apple targets only)") orelse false;
         if (blas and !platform.isApple()) {
             log.err("-Dblas: only the Accelerate vendor is configured, which is Apple's", .{});
@@ -599,6 +645,9 @@ const Config = struct {
         if (platform == .windows) try defs.appendSlice(b.allocator, &windows_defines);
         // Only `ggml-backend-reg.cpp` reads it, to register the backend.
         if (vulkan != null) try defs.append(b.allocator, "-DGGML_USE_VULKAN");
+        // PUBLIC on ggml (ggml/src/CMakeLists.txt:436); likewise read only by
+        // `ggml-backend-reg.cpp`.
+        if (cuda != null) try defs.append(b.allocator, "-DGGML_USE_CUDA");
         if (blas) try defs.append(b.allocator, "-DGGML_USE_BLAS");
 
         // Declared on every platform, so passing it is never an error, then
@@ -626,14 +675,15 @@ const Config = struct {
             .cxx = try join(b, lang_cxx, defs.items),
             .objc = try join(b, &objc_std, defs.items),
             .vulkan = vulkan,
-            .ui = b.option([]const u8, "ui", "Embed the web UI built in this directory (a SvelteKit dist; `make ui` writes .ui/dist). Default: no UI"),
+            .cuda = cuda,
+            .ui =b.option([]const u8, "ui", "Embed the web UI built in this directory (a SvelteKit dist; `make ui` writes .ui/dist). Default: no UI"),
             .ui_gzip = b.option(bool, "ui-gzip", "gzip-compress the embedded web UI, as upstream's LLAMA_UI_GZIP (default true)") orelse true,
         };
     }
 
     /// Build ggml with its CPU backend -- and, on Apple platforms, its Metal
-    /// backend, with `-Dblas` its BLAS backend, and with `-Dvulkan` its Vulkan
-    /// one -- as one static archive.
+    /// backend, with `-Dblas` its BLAS backend, with `-Dvulkan` its Vulkan
+    /// one, and with `-Dcuda` its CUDA one -- as one static archive.
     ///
     /// CMake splits the backends so they can be loaded dynamically. With static
     /// linking and `GGML_BACKEND_DL` off that split carries no meaning:
@@ -687,6 +737,7 @@ const Config = struct {
         }
 
         if (self.vulkan) |vk| try self.addVulkan(vk, mod);
+        if (self.cuda) |cu| try self.addCuda(cu, mod);
 
         return self.addLibrary("ggml", mod);
     }
@@ -927,6 +978,7 @@ const Config = struct {
         });
         mod.linkLibrary(cli_impl);
         self.linkVulkan(mod);
+        self.linkCuda(mod);
 
         // tools/server/CMakeLists.txt:71, llama-server: main.cpp over llama-server-impl.
         const server = blk: {
@@ -940,6 +992,7 @@ const Config = struct {
             });
             smod.linkLibrary(server_impl);
             self.linkVulkan(smod);
+            self.linkCuda(smod);
             break :blk self.addExecutable("llama-server", smod);
         };
 
@@ -1148,6 +1201,97 @@ const Config = struct {
         }
     }
 
+    /// Add ggml's CUDA backend to `mod`: every `.cu` file CMake lists,
+    /// compiled by `nvcc` into an object the archive carries.
+    ///
+    /// Replaces `enable_language(CUDA)` and `ggml-cuda/CMakeLists.txt:114-128`.
+    /// Each file is a cached `nvcc` run of its own, with the command line
+    /// CMake's Makefiles give it (`-forward-unknown-to-host-compiler`,
+    /// defines, includes, `CUDA_FLAGS`, `-MD`, `-x cu -c`). nvcc's depfile is
+    /// handed to Zig, so a changed header recompiles exactly the files that
+    /// include it. No device-link step is needed: CMake leaves
+    /// `CUDA_SEPARABLE_COMPILATION` off, so each object is self-contained.
+    ///
+    /// nvcc's host compiler is left at its default, g++, as CMake leaves it.
+    /// Zig's own clang cannot stand in: CUDA 13.0's `crt/math_functions.hpp`
+    /// redeclares the `isnan`/`isinf` overloads Zig's libc++ 22 already
+    /// provides, and every file that includes `ggml-impl.h` fails on the
+    /// ambiguity. The objects' host code therefore links against libstdc++
+    /// (`linkCuda`), which `libcudart.so` loads in any case; it shares no C++
+    /// types with the rest of ggml, which reaches the backend only through its
+    /// C API.
+    ///
+    /// - `cu`: What `configureCuda` resolved.
+    /// - `mod`: ggml's module, which gains the objects.
+    /// - Returns: Nothing; propagates directory-read failures.
+    fn addCuda(self: *const Self, cu: Cuda, mod: *std.Build.Module) !void {
+        const b = self.b;
+        var files: std.ArrayList([]const u8) = .empty;
+        try self.appendGlobPrefixed(&files, cuda_dir, "", ".cu");
+        const inst = cuda_dir ++ "/template-instances";
+        for ([_][]const u8{ "fattn-tile", "fattn-mma", "mmq", "mmf" }) |prefix| {
+            try self.appendGlobPrefixed(&files, inst, prefix, ".cu");
+        }
+        try files.appendSlice(b.allocator, cu.fa_vec_sources);
+
+        for (files.items) |file| {
+            const run = b.addSystemCommand(&.{ cu.nvcc, "-forward-unknown-to-host-compiler" });
+            run.addArgs(cu.flags);
+            // `includes_CUDA.rsp`: `ggml-cuda/..` and `../include` from
+            // ggml_add_backend_library (ggml/src/CMakeLists.txt:400) and ggml's
+            // PUBLIC include; the toolkit's own include nvcc adds by itself.
+            //
+            // Every path is absolute, as CMake's are: nvcc bakes the source's
+            // and its headers' paths into `__FILE__` strings, and a relative
+            // one leaves the objects differing from CMake's in nothing else.
+            // They are also spelled as CMake spells them, unnormalized: a header
+            // found through `ggml-cuda/..` is named `.../ggml-cuda/../ggml-cuda/x.cuh`.
+            run.addDirectoryArg2(self.src.path(cuda_dir), .{ .prefix = "-I", .suffix = "/..", .make_absolute = true });
+            run.addDirectoryArg2(self.src.path("ggml/src"), .{ .prefix = "-I", .suffix = "/../include", .make_absolute = true });
+            run.addArgs(&.{ "-MD", "-MF" });
+            _ = run.addDepFileOutputArg2("dep.d", .{});
+            run.addArgs(&.{ "-x", "cu", "-c" });
+            run.addFileArg2(self.src.path(file), .{ .make_absolute = true });
+            run.addArg("-o");
+            const base = std.Io.Dir.path.basename(file);
+            const obj = run.addOutputFileArg2(b.fmt("{s}.o", .{base[0 .. base.len - ".cu".len]}), .{});
+            mod.addObjectFile(obj);
+        }
+        // The toolkit's libraries are linked by the executables, in `addCli`,
+        // not here, for the reason `addVulkan` gives for `libvulkan`.
+    }
+
+    /// Link the CUDA runtime, cuBLAS and the driver into an executable when
+    /// the CUDA backend is on.
+    ///
+    /// The libraries are CMake's link line for `llama-cli` with `GGML_STATIC`
+    /// off, its default (`ggml-cuda/CMakeLists.txt:175-182`): the shared
+    /// `cudart`, `cublas` and `cublasLt`, the static `culibos` that
+    /// `CUDA::cublas` carries, and the driver stub, with an rpath to the
+    /// toolkit as CMake's build tree gets. The stub directory is searched last,
+    /// so only `libcuda.so` -- which nothing but the driver provides -- comes
+    /// from it; at run time its soname finds the driver's real one.
+    ///
+    /// `libstdc++.so` is linked by path because `linkSystemLibrary("stdc++")`
+    /// is rewritten into Zig's libc++ (`std/zig/target.zig`, `isLibCppLibName`).
+    ///
+    /// - `mod`: The executable's root module.
+    fn linkCuda(self: *const Self, mod: *std.Build.Module) void {
+        const b = self.b;
+        const cu = self.cuda orelse return;
+        const lib = b.graph.cwdRelativePath(cu.lib_dir);
+        mod.addLibraryPath(lib);
+        mod.addRPath(lib);
+        mod.addLibraryPath(b.graph.cwdRelativePath(cu.stubs_dir));
+        for ([_][]const u8{ "cudart", "cublas", "cublasLt", "culibos", "cuda" }) |name| {
+            mod.linkSystemLibrary(name, .{ .use_pkg_config = .no });
+        }
+        mod.addObjectFile(b.graph.cwdRelativePath(cu.libstdcxx));
+        // Last, so it only fills what compiler_rt leaves undefined; g++ adds it
+        // to CMake's link the same way.
+        mod.addObjectFile(b.graph.cwdRelativePath(cu.libgcc));
+    }
+
     /// Embed a built web UI, as `scripts/ui-assets.cmake`'s `emit_files` does.
     ///
     /// Upstream's CMake first provisions the SvelteKit bundle -- `npm ci` and
@@ -1214,6 +1358,24 @@ const Config = struct {
     /// - `ext`: The extension to match, including the dot.
     /// - Returns: Nothing; propagates directory-read and allocation failures.
     fn appendGlob(self: *const Self, files: *std.ArrayList([]const u8), dir: []const u8, ext: []const u8) !void {
+        return self.appendGlobPrefixed(files, dir, "", ext);
+    }
+
+    /// Append every file in `dir` whose name starts with `prefix` and ends with
+    /// `ext`, as a CMake `file(GLOB "<dir>/<prefix>*<ext>")` does.
+    ///
+    /// - `files`: The list source-relative paths are appended to.
+    /// - `dir`: The directory to read, relative to the sources.
+    /// - `prefix`: The name's required start; empty matches every name.
+    /// - `ext`: The extension to match, including the dot.
+    /// - Returns: Nothing; propagates directory-read and allocation failures.
+    fn appendGlobPrefixed(
+        self: *const Self,
+        files: *std.ArrayList([]const u8),
+        dir: []const u8,
+        prefix: []const u8,
+        ext: []const u8,
+    ) !void {
         const b = self.b;
         // `dir` is relative to the sources, and so are the paths appended, since
         // the source lists are resolved against `self.src`.
@@ -1229,6 +1391,7 @@ const Config = struct {
         var it = handle.iterate();
         while (try it.next(b.graph.io)) |entry| {
             if (entry.kind != .file) continue;
+            if (!std.mem.startsWith(u8, entry.name, prefix)) continue;
             if (!std.mem.endsWith(u8, entry.name, ext)) continue;
             try files.append(b.allocator, b.fmt("{s}/{s}", .{ dir, entry.name }));
         }
@@ -1360,6 +1523,249 @@ const Config = struct {
             .lib_dirs = lib_opt orelse &.{},
             .features = features.items,
         };
+    }
+
+    /// Read the `-Dcuda` options and resolve them into `nvcc`'s command line
+    /// and the toolkit's link inputs, as `ggml-cuda/CMakeLists.txt` and
+    /// `ggml_cuda_fattn_vec_instances` (`ggml/cmake/common.cmake:60`) do.
+    ///
+    /// The defines are the ones CMake's `flags.make` gives the target, in its
+    /// order: the 49 FlashAttention K/V switches and their summary,
+    /// `GGML_CUDA_USE_GRAPHS` (on, because llama.cpp's top-level
+    /// `CMakeLists.txt:171` changes ggml's default), and ggml's directory-wide
+    /// `GGML_SCHED_MAX_COPIES`, `_GNU_SOURCE` and `_XOPEN_SOURCE=600`. That
+    /// last one this build otherwise leaves out (see `linux_defines`); it is
+    /// kept here because these objects come from CMake's own compilers, so
+    /// nothing short of CMake's exact command line lets them match its objects
+    /// byte for byte. `GGML_ALL_WARNINGS`'s `-Xcompiler` warnings are dropped;
+    /// they change diagnostics only.
+    ///
+    /// - `b`: The build graph, for its options, allocator and process spawning.
+    /// - `platform`: Must be Linux.
+    /// - `target`: Must be the host's own OS and architecture: nvcc's host
+    ///   compiler and the toolkit are the host's.
+    /// - `optimize`: Picks CMake's per-configuration `CMAKE_CUDA_FLAGS_*`.
+    /// - Returns: Null without `-Dcuda`; otherwise the configuration, or an
+    ///   error for an unsupported target, a missing toolkit or host compiler,
+    ///   or a malformed `-Dcuda-arch` or `-Dcuda-fa-quants`.
+    fn configureCuda(b: *std.Build, platform: Platform, target: std.Target, optimize: std.lang.Optimize) !?Cuda {
+        const enabled = b.option(bool, "cuda", "Build ggml's CUDA backend (Linux, host architecture; needs the CUDA toolkit and g++)") orelse false;
+        const path_opt = b.option([]const u8, "cuda-path", "The CUDA toolkit (default: $CUDA_PATH, else /usr/local/cuda)");
+        const arch_opt = b.option([]const []const u8, "cuda-arch", "GPU architectures in CMAKE_CUDA_ARCHITECTURES spelling, e.g. 121a-real (default: CMake's non-native list for the toolkit)");
+        const fa_opt = b.option([]const u8, "cuda-fa-quants", "FlashAttention vector-kernel K-V types, as GGML_CUDA_FA_QUANTS: comma-separated <K>-<V>, or all (default: " ++ cuda_fa_quants_default ++ ")");
+        if (!enabled) return null;
+
+        const host = b.graph.host.result;
+        if (platform != .linux or target.cpu.arch != host.cpu.arch or target.os.tag != host.os.tag) {
+            log.err("-Dcuda builds for the host only, and only on Linux: nvcc's host compiler and the toolkit's libraries are the host's", .{});
+            return error.UnsupportedTarget;
+        }
+
+        const env_path = b.graph.environ_map.get("CUDA_PATH");
+        const cuda_path = path_opt orelse env_path orelse "/usr/local/cuda";
+        const nvcc = b.pathJoin(&.{ cuda_path, "bin", "nvcc" });
+        const version_out = switch (b.runFallible(&.{ nvcc, "--version" }, .{ .stderr_behavior = .ignore })) {
+            .success => |stdout| stdout,
+            else => {
+                log.err("-Dcuda: {s} does not run; pass -Dcuda-path=<toolkit>", .{nvcc});
+                return error.NvccNotFound;
+            },
+        };
+        const toolkit = parseNvccVersion(version_out) orelse {
+            log.err("-Dcuda: no 'release X.Y' in {s} --version", .{nvcc});
+            return error.NvccNotFound;
+        };
+        const at_least = struct {
+            fn f(v: [2]u32, major: u32, minor: u32) bool {
+                return v[0] > major or (v[0] == major and v[1] >= minor);
+            }
+        }.f;
+
+        // nvcc's default host compiler, whose runtime the objects need.
+        const libstdcxx = try hostCompilerFile(b, "-print-file-name=libstdc++.so");
+        const libgcc = try hostCompilerFile(b, "-print-libgcc-file-name");
+
+        // ggml-cuda/CMakeLists.txt:43-68, the GGML_NATIVE=OFF defaults.
+        var archs: std.ArrayList([]const u8) = .empty;
+        if (arch_opt) |list| {
+            try archs.appendSlice(b.allocator, list);
+        } else {
+            if (!at_least(toolkit, 13, 0)) try archs.appendSlice(b.allocator, &.{ "50-virtual", "61-virtual", "70-virtual" });
+            try archs.appendSlice(b.allocator, &.{ "75-virtual", "80-virtual", "86-real" });
+            if (at_least(toolkit, 11, 8)) try archs.appendSlice(b.allocator, &.{ "89-real", "90-virtual" });
+            if (at_least(toolkit, 12, 8)) try archs.append(b.allocator, "120a-real");
+            if (at_least(toolkit, 12, 9)) try archs.append(b.allocator, "121a-real");
+        }
+
+        var flags: std.ArrayList([]const u8) = .empty;
+        const fa = try cudaFaQuants(b, fa_opt orelse cuda_fa_quants_default);
+        try flags.appendSlice(b.allocator, fa.defines);
+        try flags.appendSlice(b.allocator, &.{
+            "-DGGML_CUDA_USE_GRAPHS",
+            "-DGGML_SCHED_MAX_COPIES=4",
+            "-D_GNU_SOURCE",
+            "-D_XOPEN_SOURCE=600",
+        });
+        // CMAKE_CUDA_FLAGS_<CONFIG>, then CUDA_STANDARD from cxx_std_17
+        // (ggml/src/CMakeLists.txt:619).
+        try flags.appendSlice(b.allocator, if (optimize == .debug) &.{"-g"} else &.{ "-O3", "-DNDEBUG" });
+        try flags.append(b.allocator, "-std=c++17");
+        for (archs.items) |arch| try flags.append(b.allocator, try cudaGencode(b, arch));
+        // ggml-cuda/CMakeLists.txt:196-262.
+        try flags.appendSlice(b.allocator, &.{ "-use_fast_math", "-extended-lambda" });
+        if (at_least(toolkit, 12, 8)) try flags.append(b.allocator, "-compress-mode=size");
+        try flags.appendSlice(b.allocator, &.{ "-Xcompiler", "-Wno-pedantic" });
+
+        return .{
+            .nvcc = nvcc,
+            .lib_dir = b.pathJoin(&.{ cuda_path, "lib64" }),
+            .stubs_dir = b.pathJoin(&.{ cuda_path, "lib64", "stubs" }),
+            .libstdcxx = libstdcxx,
+            .libgcc = libgcc,
+            .flags = flags.items,
+            .fa_vec_sources = fa.sources,
+        };
+    }
+
+    /// Ask g++, nvcc's default host compiler, where one of its runtime files is.
+    ///
+    /// - `b`: The build graph, for process spawning.
+    /// - `query`: The `-print-...` flag naming the file.
+    /// - Returns: The file's path; `error.HostCompilerNotFound` when g++ does
+    ///   not run.
+    fn hostCompilerFile(b: *std.Build, query: []const u8) ![]const u8 {
+        return switch (b.runFallible(&.{ "g++", query }, .{ .stderr_behavior = .ignore })) {
+            .success => |stdout| std.mem.trim(u8, stdout, " \r\n"),
+            else => {
+                log.err("-Dcuda: g++, nvcc's host compiler, does not run", .{});
+                return error.HostCompilerNotFound;
+            },
+        };
+    }
+
+    /// Find the toolkit's version in `nvcc --version`'s output.
+    ///
+    /// - `out`: The output, whose last lines read `... release 13.0, V13.0.88`.
+    /// - Returns: The major and minor version; null when none is found.
+    fn parseNvccVersion(out: []const u8) ?[2]u32 {
+        const key = "release ";
+        const at = std.mem.find(u8, out, key) orelse return null;
+        const rest = out[at + key.len ..];
+        const end = std.mem.findAny(u8, rest, ", \n") orelse rest.len;
+        var it = std.mem.splitScalar(u8, rest[0..end], '.');
+        const major = std.fmt.parseInt(u32, it.next() orelse return null, 10) catch return null;
+        const minor = std.fmt.parseInt(u32, it.next() orelse return null, 10) catch return null;
+        return .{ major, minor };
+    }
+
+    /// Translate one `CMAKE_CUDA_ARCHITECTURES` entry into the `nvcc` flag
+    /// CMake generates for it, after CMake's own rewrite of a plain Blackwell
+    /// `12X` into the architecture-specific `12Xa`
+    /// (`ggml-cuda/CMakeLists.txt:92-104`), which its FP4 tensor-core
+    /// instructions need.
+    ///
+    /// - `b`: The build graph, whose allocator owns the result.
+    /// - `spec`: `<arch>`, `<arch>-real` or `<arch>-virtual`, e.g. `121a-real`.
+    /// - Returns: `--generate-code=arch=compute_<a>,code=[...]`; an error for
+    ///   an entry that is not of that form.
+    fn cudaGencode(b: *std.Build, spec: []const u8) ![]const u8 {
+        const dash = std.mem.findScalar(u8, spec, '-');
+        var arch = spec[0 .. dash orelse spec.len];
+        const kind = if (dash) |d| spec[d + 1 ..] else "";
+        if (arch.len == 0 or !std.ascii.isDigit(arch[0])) {
+            log.err("-Dcuda-arch: '{s}' is not <arch>[-real|-virtual]", .{spec});
+            return error.InvalidCudaArch;
+        }
+        if (arch.len == 3 and std.mem.startsWith(u8, arch, "12") and std.ascii.isDigit(arch[2])) {
+            arch = b.fmt("{s}a", .{arch});
+        }
+        const code = if (std.mem.eql(u8, kind, "real"))
+            b.fmt("sm_{s}", .{arch})
+        else if (std.mem.eql(u8, kind, "virtual"))
+            b.fmt("compute_{s}", .{arch})
+        else if (kind.len == 0)
+            b.fmt("compute_{s},sm_{s}", .{ arch, arch })
+        else {
+            log.err("-Dcuda-arch: '{s}' is not <arch>[-real|-virtual]", .{spec});
+            return error.InvalidCudaArch;
+        };
+        return b.fmt("--generate-code=arch=compute_{s},code=[{s}]", .{ arch, code });
+    }
+
+    /// What `cudaFaQuants` resolves `GGML_CUDA_FA_QUANTS` to.
+    const CudaFa = struct {
+        const Self = @This();
+        /// `GGML_CUDA_FA_<K>_<V>=0|1` for every pair, then `GGML_CUDA_FA_QUANTS`.
+        defines: []const []const u8,
+        /// The vector-kernel instance per selected pair.
+        sources: []const []const u8,
+    };
+
+    /// Resolve `GGML_CUDA_FA_QUANTS` as `ggml_cuda_fattn_vec_instances` does:
+    /// `f16-f16` always, plus each listed pair, or every pair for `all`.
+    ///
+    /// CMake orders its 49 switches by the define's name when it writes
+    /// `flags.make`, so they are sorted here too.
+    ///
+    /// - `b`: The build graph, whose allocator owns the result.
+    /// - `spec`: Comma-separated `<K>-<V>` pairs, or `all`.
+    /// - Returns: The defines and sources; an error for an unknown type or a
+    ///   malformed pair.
+    fn cudaFaQuants(b: *std.Build, spec: []const u8) !CudaFa {
+        const quants = try std.ascii.allocLowerString(b.allocator, std.mem.trim(u8, spec, " "));
+        if (quants.len == 0) {
+            log.err("-Dcuda-fa-quants must not be empty", .{});
+            return error.InvalidCudaFaQuants;
+        }
+        const all = std.mem.eql(u8, quants, "all");
+
+        var selected: std.ArrayList([]const u8) = .empty;
+        if (all) {
+            for (cuda_fa_types) |v| for (cuda_fa_types) |k| try selected.append(b.allocator, b.fmt("{s}-{s}", .{ k, v }));
+        } else {
+            try selected.append(b.allocator, "f16-f16");
+            var it = std.mem.splitScalar(u8, quants, ',');
+            while (it.next()) |raw| {
+                const pair = std.mem.trim(u8, raw, " ");
+                const dash = std.mem.findScalar(u8, pair, '-') orelse {
+                    log.err("-Dcuda-fa-quants: \"{s}\" is not \"all\" or a <type_K>-<type_V> combination", .{pair});
+                    return error.InvalidCudaFaQuants;
+                };
+                for ([_][]const u8{ pair[0..dash], pair[dash + 1 ..] }) |t| {
+                    for (cuda_fa_types) |known| {
+                        if (std.mem.eql(u8, t, known)) break;
+                    } else {
+                        log.err("-Dcuda-fa-quants: unknown type \"{s}\" in \"{s}\"", .{ t, pair });
+                        return error.InvalidCudaFaQuants;
+                    }
+                }
+                for (selected.items) |s| {
+                    if (std.mem.eql(u8, s, pair)) break;
+                } else try selected.append(b.allocator, pair);
+            }
+        }
+
+        var defines: std.ArrayList([]const u8) = .empty;
+        for (cuda_fa_types) |v| for (cuda_fa_types) |k| {
+            const pair = b.fmt("{s}-{s}", .{ k, v });
+            const on = for (selected.items) |s| {
+                if (std.mem.eql(u8, s, pair)) break true;
+            } else false;
+            const name = try std.ascii.allocUpperString(b.allocator, b.fmt("GGML_CUDA_FA_{s}_{s}", .{ k, v }));
+            try defines.append(b.allocator, b.fmt("-D{s}={d}", .{ name, @intFromBool(on) }));
+        };
+        std.mem.sort([]const u8, defines.items, {}, struct {
+            fn lt(_: void, x: []const u8, y: []const u8) bool {
+                return std.mem.order(u8, x, y) == .lt;
+            }
+        }.lt);
+        try defines.append(b.allocator, b.fmt("-DGGML_CUDA_FA_QUANTS=\"{s}\"", .{quants}));
+
+        var sources: std.ArrayList([]const u8) = .empty;
+        for (selected.items) |pair| {
+            try sources.append(b.allocator, b.fmt("{s}/template-instances/fattn-vec-instance-{s}.cu", .{ cuda_dir, pair }));
+        }
+        return .{ .defines = defines.items, .sources = sources.items };
     }
 };
 

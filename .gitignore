@@ -9,5 +9,6 @@ zig-pkg
 # The web UI build (`make ui`): staged sources, node_modules, dist.
 .ui
 
-# The CMake reference build (`make ref`).
+# The CMake reference builds (`make ref`, and the CUDA one).
 .ref
+.ref-cuda
