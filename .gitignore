@@ -12,3 +12,5 @@ zig-pkg
 # The CMake reference builds (`make ref`, and the CUDA one).
 .ref
 .ref-cuda
+
+*.gguf

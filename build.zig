@@ -83,10 +83,10 @@ const src_dep = "llama_cpp";
 /// `git rev-parse --short HEAD` and `build_number` the build tag's number
 /// (`git describe --tags --match 'b*'`), as cmake/build-info.cmake derives
 /// them.
-const version = "0.9.0";
-const ggml_version = "0.29.0";
-const commit = "cd959bae9";
-const build_number = 12110;
+const version = "1.0.0";
+const ggml_version = "1.0.0";
+const commit = "b1b770d90";
+const build_number = 12359;
 
 /// The platforms this build knows how to configure.
 ///
@@ -194,7 +194,7 @@ const apple_defines = [_][]const u8{
 const subprocess_defines = [_][]const u8{"-DLLAMA_SUBPROCESS"};
 
 /// CPU affinity and some allocation interfaces are GNU extensions on Linux.
-/// From `ggml/src/CMakeLists.txt:152-155`.
+/// From `ggml/src/CMakeLists.txt:146-149`.
 ///
 /// The POSIX-conformance macros CMake also sets globally (`_XOPEN_SOURCE=600`,
 /// `_DARWIN_C_SOURCE`) are deliberately absent: the Apple builds are verified
@@ -202,7 +202,7 @@ const subprocess_defines = [_][]const u8{"-DLLAMA_SUBPROCESS"};
 /// that already matches can only move it.
 const linux_defines = [_][]const u8{"-D_GNU_SOURCE"};
 
-/// From `CMakeLists.txt:81` and `ggml/src/CMakeLists.txt:182`, both `if
+/// From `CMakeLists.txt:81` and `ggml/src/CMakeLists.txt:176`, both `if
 /// (WIN32)`. The target is MinGW (`x86_64-windows-gnu`), the only Windows ABI
 /// Zig ships a libc for; CMake's MinGW arms otherwise only pick static linking,
 /// which this build always does.
@@ -354,19 +354,20 @@ const llama_sources = [_][]const u8{
 const common_sources = [_][]const u8{
     "common/arg.cpp",                      "common/chat-auto-parser-generator.cpp",
     "common/chat-auto-parser-helpers.cpp", "common/chat-diff-analyzer.cpp",
-    "common/chat-peg-parser.cpp",          "common/chat.cpp",
-    "common/common.cpp",                   "common/console.cpp",
-    "common/debug.cpp",                    "common/download.cpp",
-    "common/fit.cpp",                      "common/file-lock.cpp",
-    "common/hf-cache.cpp",                 "common/imatrix-loader.cpp",
-    "common/json-schema-to-grammar.cpp",   "common/json-schema.cpp",
-    "common/json.cpp",                     "common/llguidance.cpp",
-    "common/log.cpp",                      "common/ngram-cache.cpp",
-    "common/ngram-map.cpp",                "common/ngram-mod.cpp",
-    "common/peg-parser.cpp",               "common/preset.cpp",
-    "common/reasoning-budget.cpp",         "common/sampling.cpp",
-    "common/speculative.cpp",              "common/subproc.cpp",
-    "common/trie.cpp",                     "common/unicode.cpp",
+    "common/chat-peg-parser.cpp",          "common/chat-tts-norm.cpp",
+    "common/chat.cpp",                     "common/common.cpp",
+    "common/console.cpp",                  "common/debug.cpp",
+    "common/download.cpp",                 "common/fit.cpp",
+    "common/file-lock.cpp",                "common/hf-cache.cpp",
+    "common/imatrix-loader.cpp",           "common/json-schema-to-grammar.cpp",
+    "common/json-schema.cpp",              "common/json.cpp",
+    "common/llguidance.cpp",               "common/log.cpp",
+    "common/ngram-cache.cpp",              "common/ngram-map.cpp",
+    "common/ngram-mod.cpp",                "common/peg-parser.cpp",
+    "common/preset.cpp",                   "common/reasoning-budget.cpp",
+    "common/sampling.cpp",                 "common/speculative.cpp",
+    "common/subproc.cpp",                  "common/trie.cpp",
+    "common/unicode.cpp",
     "common/jinja/lexer.cpp",              "common/jinja/parser.cpp",
     "common/jinja/runtime.cpp",            "common/jinja/value.cpp",
     "common/jinja/string.cpp",             "common/jinja/caps.cpp",
@@ -384,7 +385,11 @@ const common_sources = [_][]const u8{
     "common/parsers/translate-gemma.cpp",
 };
 
-/// `MTMD_VIDEO`, private to mtmd (`tools/mtmd/CMakeLists.txt:100`).
+/// mtmd's private definition for `M_PI` (`tools/mtmd/CMakeLists.txt:115`).
+/// Only MSVC's and MinGW's `<math.h>` read it; elsewhere it changes nothing.
+const mtmd_defines = [_][]const u8{"-D_USE_MATH_DEFINES"};
+
+/// `MTMD_VIDEO`, private to mtmd (`tools/mtmd/CMakeLists.txt:117`).
 const mtmd_video_defines = [_][]const u8{"-DMTMD_VIDEO"};
 
 /// mtmd's own sources. The per-architecture files under `models/` are globbed,
@@ -395,7 +400,9 @@ const mtmd_sources = [_][]const u8{
     "tools/mtmd/mtmd-image.cpp",
     "tools/mtmd/mtmd-helper.cpp",
     "tools/mtmd/mtmd-helper-gen.cpp",
-    "tools/mtmd/clip.cpp",
+    "tools/mtmd/mtmd-model.cpp",
+    "tools/mtmd/mtmd-subcontext.cpp",
+    "tools/mtmd/mtmd-graph.cpp",
 };
 
 const server_context_sources = [_][]const u8{
@@ -698,7 +705,7 @@ const Config = struct {
         mod.addIncludePath(self.src.path("ggml/include"));
         mod.addIncludePath(self.src.path("ggml/src"));
         mod.addIncludePath(self.src.path("ggml/src/ggml-cpu"));
-        // ggml/src/CMakeLists.txt:216, configure_file(ggml-version.h.in).
+        // ggml/src/CMakeLists.txt:210, configure_file(ggml-version.h.in).
         mod.addConfigHeader(b.addConfigHeader(.{
             .style = .{ .cmake = self.src.path("ggml/src/ggml-version.h.in") },
             .include_path = "ggml-version.h",
@@ -811,7 +818,7 @@ const Config = struct {
     /// Build mtmd, multimodal support. The CLI links it through server-context;
     /// the xcframework carries it as upstream's does (`LLAMA_BUILD_MTMD=ON`).
     ///
-    /// `MTMD_VIDEO` is a private definition (`tools/mtmd/CMakeLists.txt:100`),
+    /// `MTMD_VIDEO` is a private definition (`tools/mtmd/CMakeLists.txt:117`),
     /// read by `mtmd-helper.cpp`, whose video path includes the header-only
     /// `vendor/sheredom/subprocess.h` from the `vendor` include path; see
     /// `mtmd_video` for when it is on. `build-xcframework.sh` turns it off for
@@ -837,7 +844,8 @@ const Config = struct {
         try files.appendSlice(b.allocator, &mtmd_sources);
         try self.appendGlob(&files, "tools/mtmd/models", ".cpp");
 
-        const flags = if (self.mtmd_video) try join(b, self.cxx, &mtmd_video_defines) else self.cxx;
+        const base = try join(b, self.cxx, &mtmd_defines);
+        const flags = if (self.mtmd_video) try join(b, base, &mtmd_video_defines) else base;
         mod.addCSourceFiles(.{ .root = self.src.path(""), .files = files.items, .flags = flags });
         mod.linkLibrary(llama);
         mod.linkLibrary(ggml);

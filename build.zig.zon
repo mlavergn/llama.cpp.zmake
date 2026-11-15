@@ -1,6 +1,6 @@
 .{
     .name = .llamacpp,
-    .version = "0.9.0+3",
+    .version = "1.0.0",
     .fingerprint = 0xba4bceda0b5665ac,
     .minimum_zig_version = "0.17.0",
     // Only this build system. The llama.cpp sources live in a subdirectory
@@ -13,8 +13,8 @@
     },
     .dependencies = .{
         .llama_cpp = .{
-            .url = "https://github.com/ggml-org/llama.cpp/archive/refs/tags/v0.9.0.tar.gz",
-            .hash = "N-V-__8AAIZK7wowrVPBF1a0QUlJdooy7ZP3UWj8fX4A3KG3",
+            .url = "https://github.com/ggml-org/llama.cpp/archive/refs/tags/v1.0.0.tar.gz",
+            .hash = "N-V-__8AABab-AqLO_plft_4hppcvsOrhbZdWcuIl6NAkXsa",
         },
     },
 }

@@ -31,7 +31,7 @@ anything: `make pin LLAMA_CPP_TAG=<tag>` rewrites the URL and hash in
 ## Use
 
 ```sh
-make fetch     # fetch llama.cpp v0.9.0 ahead of time (any build does it too)
+make fetch     # fetch llama.cpp v1.0.0 ahead of time (any build does it too)
 make           # build everything for the host
 make cli       # llama-cli, optimized, then chat with $(MODEL)
 make lib       # ggml and libllama only
@@ -182,8 +182,11 @@ Things CMake does that are easy to miss, each of which cost real debugging:
 - **`MTMD_VIDEO` follows `LLAMA_SUBPROCESS`**, on by default and off on iOS,
   as CMake's mtmd has it (`tools/mtmd/CMakeLists.txt:5-11`).
   `-Dmtmd-video=false` turns it off.
+- **mtmd's models compile one file at a time.** CMake builds them as a unity
+  build (`UNITY_BUILD ON`, batches of 16) since v1.0.0; that changes compile
+  time, not what the code computes, and touches no text tokens.
 - **`_GNU_SOURCE` is required on Linux.** ggml reaches for the GNU CPU-affinity
-  and allocation extensions (`ggml/src/CMakeLists.txt:152-155`). The
+  and allocation extensions (`ggml/src/CMakeLists.txt:146-149`). The
   POSIX-conformance macros CMake also sets globally — `_XOPEN_SOURCE=600` and
   `_DARWIN_C_SOURCE` — are deliberately *not* set here: the Apple builds are
   verified token-identical without them.

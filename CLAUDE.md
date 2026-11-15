@@ -195,7 +195,7 @@ against it: three prompts, each with `-ngl 99` and `-ngl 0` (`VERIFY_NGL`),
 stripping exactly those three lines and failing on the traps below. Any
 `llama-cli` can be the reference (`REF=<binary>`), or the one under test, by
 running `zig/verify.sh <ref> <test> <model> [ngl ...]` directly. Last run,
-after `MTMD_VIDEO`: 6 of 6.
+at v1.0.0: 6 of 6.
 
 The recipe above is the macOS one; the same shape applies to the other two.
 For Linux, drop the Darwin/Metal/Accelerate flags and run both binaries on an
@@ -293,8 +293,16 @@ Six CMake behaviours that are easy to miss. Each of these cost real debugging;
   how its absence here long went unnoticed. `-Dmtmd-video=false` turns
   it off; `make xcframework` does for every slice but macOS, as
   `build-xcframework.sh` does.
+- **mtmd's models are compiled one file at a time, not as a unity build.**
+  Since v1.0.0 CMake sets `UNITY_BUILD ON`, batch size 16, on `mtmd`, with
+  its core sources excluded (`tools/mtmd/CMakeLists.txt:97-107`), so the
+  reference compiles `models/*.cpp` as concatenated `unity_N_cxx.cxx` files.
+  That is a compile-time measure; it does not change what any function
+  computes, and per-file compilation is what a source not written for unity
+  must survive anyway. It touches only multimodal input, never text tokens.
+  `_USE_MATH_DEFINES`, which CMake added for the same reason, is passed.
 - **`_GNU_SOURCE` is required on Linux** — ggml reaches for the GNU
-  CPU-affinity and allocation extensions (`ggml/src/CMakeLists.txt:152-155`).
+  CPU-affinity and allocation extensions (`ggml/src/CMakeLists.txt:146-149`).
   The POSIX-conformance macros CMake also sets globally, `_XOPEN_SOURCE=600`
   and `_DARWIN_C_SOURCE`, are deliberately *not* set here: the Apple builds are
   verified token-identical without them, and adding a feature-test macro to a
