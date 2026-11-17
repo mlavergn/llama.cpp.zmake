@@ -475,12 +475,12 @@ const Vulkan = struct {
 const cuda_dir = "ggml/src/ggml-cuda";
 
 /// The FlashAttention K/V types `ggml_cuda_fattn_vec_instances` knows
-/// (`ggml/cmake/common.cmake:61`), in its order.
-const cuda_fa_types = [_][]const u8{ "q4_0", "q4_1", "q5_0", "q5_1", "q8_0", "bf16", "f16" };
+/// (`ggml/cmake/common.cmake:61`), in its order; `f8_e4m3` since v1.0.0.
+const cuda_fa_types = [_][]const u8{ "q4_0", "q4_1", "q5_0", "q5_1", "q8_0", "bf16", "f16", "f8_e4m3" };
 
 /// `GGML_CUDA_FA_QUANTS`'s default (`ggml/CMakeLists.txt:208`), with the
 /// commas CMake's define joins it with.
-const cuda_fa_quants_default = "q4_0-q4_0,q8_0-q8_0,f16-f16,bf16-bf16";
+const cuda_fa_quants_default = "q4_0-q4_0,q8_0-q8_0,f16-f16,bf16-bf16,f8_e4m3-f8_e4m3";
 
 /// What `-Dcuda` resolved to at configure time.
 const Cuda = struct {
